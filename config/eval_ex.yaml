@@ -1,5 +1,5 @@
 output_dir_folder: ./res_out
-input_dir_folder: /path/to/data
+input_dir_folder: /home/casado/DsensDp/data/out/cropharvest_binary.ncs
 
 task_type: classification
 #task_type: multilabel

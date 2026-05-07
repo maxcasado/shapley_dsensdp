@@ -1,14 +1,15 @@
 output_dir_folder: ./res_out
-input_dir_folder: /path/to/data
+input_dir_folder: /home/casado/DsensDp/data/out/
 additional_method_name: -Plus
 
 load_memory: True
-data_name: cropharvest_multi
+compute_shapley: True
+data_name: cropharvest_binary
 task_type: classification
 
 training:
-  max_epochs: 2
-  batch_size: 256
+  max_epochs: 100 # was 2 changed to100 like in the paper
+  batch_size: 128 # was 256 changed to 128 like in the paper
   emb_dim: 128
   early_stop_args:
     min_delta: 0.01
@@ -36,25 +37,25 @@ training:
 
 experiment: 
   runs_seed: [10] #repetitions
-  kfolds: 2
+  kfolds: 5
   preprocess: 
     fillnan: False
     flatten: False
     form: zscore  
     view_names: ["S2_S2VI","S1" ,"weather","DEM"]
 
-args_forward: #only for testing
-  list_testing_views: [
-    [ ["S2_S2VI"], [1.00] ] , #single-view prediction
-    [ ["S1"], [1.00] ] , #single-view prediction
-    [ ["weather"], [1.00] ] , #single-view prediction
-    [ ["DEM"], [1.00] ] , #single-view prediction
-    [ ["S2_S2VI", "weather", "DEM"], [1.0] ], #multi-view prediction
-    [ ["S2_S2VI", "S1", "DEM"], [1.0] ], #multi-view prediction
-    [ ["S2_S2VI", "S1", "weather"], [1.0] ], #multi-view prediction
-    [ ["S1", "weather", "DEM"], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 , 0.9, 1.00] ], #only missing S2 in different rates
-  ]
-  batch_size: 64
+# args_forward: #only for testing
+#   list_testing_views: [
+#     [ ["S2_S2VI"], [1.00] ] , #single-view prediction
+#     [ ["S1"], [1.00] ] , #single-view prediction
+#     [ ["weather"], [1.00] ] , #single-view prediction
+#     [ ["DEM"], [1.00] ] , #single-view prediction
+#     [ ["S2_S2VI", "weather", "DEM"], [1.0] ], #multi-view prediction
+#     [ ["S2_S2VI", "S1", "DEM"], [1.0] ], #multi-view prediction
+#     [ ["S2_S2VI", "S1", "weather"], [1.0] ], #multi-view prediction
+#     [ ["S1", "weather", "DEM"], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 , 0.9, 1.00] ], #only missing S2 in different rates
+#   ]
+#   batch_size: 64
 
 
 architecture:
