@@ -135,3 +135,54 @@ def MultiFusion_train(train_data: dict, val_data = None,
     checkpoint = torch.load(trainer.checkpoint_callback.best_model_path)
     model.load_state_dict(checkpoint['state_dict'])
     return model, trainer
+
+def build_model(train_data, training={}, method={}, architecture={}, **kwargs):
+    import copy as _copy
+    training  = _copy.deepcopy(training)   # eviter de muter le config de l'appelant
+    method    = _copy.deepcopy(method)
+    loss_args = training["loss_args"]
+    emb_dim   = training["emb_dim"]
+
+    if "weight" in loss_args:
+        n_labels = loss_args.pop("n_labels")
+        loss_args["weight"] = torch.tensor(loss_args["weight"], dtype=torch.float)
+    elif "pos_weight" in loss_args:
+        n_labels = loss_args.pop("n_labels")
+        loss_args["pos_weight"] = torch.tensor(loss_args["pos_weight"], dtype=torch.float)
+    else:
+        n_labels = loss_args.get("n_labels", 1)
+
+    views_encoder = {}
+    for view_n in train_data.used_view_names:
+        actual_shape_v = get_shape_view(view_n, train_data, architecture=architecture)
+        views_encoder[view_n] = create_model(actual_shape_v, emb_dim, **architecture["encoders"][view_n])
+
+    args_model = {"loss_args": loss_args, **training.get("additional_args", {})}
+
+    if method["feature"]:
+        method["agg_args"]["emb_dims"] = get_dic_emb_dims(views_encoder)
+        fusion_module = FusionModuleMissing(**method["agg_args"])
+        input_dim_task_mapp = fusion_module.get_info_dims()["joint_dim"]
+        predictive_model = create_model(input_dim_task_mapp, n_labels, **architecture["predictive_model"], encoder=False)
+        model = FeatureFusion(views_encoder, fusion_module, predictive_model,
+                              view_names=list(views_encoder.keys()), **args_model)
+    else:
+        method["agg_args"]["emb_dims"] = [n_labels for _ in range(len(views_encoder))]
+        fusion_module = FusionModuleMissing(**method["agg_args"])
+        pred_base = create_model(emb_dim, n_labels, **architecture["predictive_model"], encoder=False)
+        prediction_models = {}
+        for view_n in views_encoder:
+            if architecture["predictive_model"].get("sharing"):
+                pred_ = pred_base
+            else:
+                pred_ = copy.deepcopy(pred_base)
+                pred_.load_state_dict(pred_base.state_dict())
+            prediction_models[view_n] = torch.nn.Sequential(views_encoder[view_n], pred_)
+            prediction_models[view_n].get_output_size = pred_.get_output_size
+        model = DecisionFusion(view_encoders=prediction_models, fusion_module=fusion_module,
+                               view_names=list(views_encoder.keys()), **args_model)
+
+    if "missing_as_aug" in training:
+        model.set_missing_info(aug_status=training["missing_as_aug"],
+                               **training.get("missing_method", {}))
+    return model
