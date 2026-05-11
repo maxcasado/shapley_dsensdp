@@ -22,15 +22,15 @@ from code.datasets.utils import create_dataloader, load_structure
 def _shapley_values(view_names, v_dict):
     n = len(view_names)
     shapley = {}
+    v_empty = v_dict.get(frozenset(), 0)  # Récupérer v(∅)
+    
     for view in view_names:
         others = [v for v in view_names if v != view]
-        phi = 0.0
+        phi = v_empty / n  #forgot this
+        
         for size in range(len(others) + 1):
             for S_tuple in itertools.combinations(others, size):
                 S = frozenset(S_tuple)
-                # Vérifier que les coalitions existent dans v_dict
-                if S not in v_dict or (S | {view}) not in v_dict:
-                    raise KeyError(f"Missing coalition: S={S} or SU{{view}}={S|{view}} not in v_dict")
                 s = len(S)
                 weight = math.factorial(s) * math.factorial(n - s - 1) / math.factorial(n)
                 phi += weight * (v_dict[S | {view}] - v_dict[S])
@@ -52,6 +52,82 @@ def _compute_metrics(y_true, y_pred_proba, task_type):
         "precision_macro":  precision_score(y_true, y_pred, average="macro", zero_division=0),
         "recall_macro":     recall_score(y_true, y_pred, average="macro",    zero_division=0),
     }
+
+def _get_random_baseline_metrics(y_true, task_type):
+    """Calcule les métriques attendues pour un classifieur aléatoire."""
+    task = (task_type or "").lower()
+
+    if task == "multilabel":
+        # Pour le multilabel, on garde l'ancien comportement (simplifié)
+        return {
+            "accuracy": 0.5,
+            "f1_macro": 0.5,
+            "f1_weighted": 0.5,
+            "precision_macro": 0.5,
+            "recall_macro": 0.5,
+        }
+
+    # Pour la classification binaire
+    unique_classes = np.unique(y_true)
+
+    if len(unique_classes) == 2:
+        # Classification binaire avec déséquilibre
+        p_pos = np.mean(y_true)  # proportion de classe positive (1)
+        p_neg = 1 - p_pos         # proportion de classe négative (0)
+
+        # Pour un classifieur aléatoire qui prédit 1 avec proba p_pos (biaisé)
+        # Matrice de confusion attendue:
+        # TP = p_pos * p_pos (vrai positif: positif réel * prédit positif)
+        # FN = p_pos * p_neg (faux négatif: positif réel * prédit négatif)
+        # FP = p_neg * p_pos (faux positif: négatif réel * prédit positif)
+        # TN = p_neg * p_neg (vrai négatif: négatif réel * prédit négatif)
+
+        tp = p_pos * p_pos
+        fn = p_pos * p_neg
+        fp = p_neg * p_pos
+        tn = p_neg * p_neg
+
+        # Précision: TP / (TP + FP)
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+
+        # Recall: TP / (TP + FN)
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+        # F1: 2 * (precision * recall) / (precision + recall)
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+        # Accuracy: (TP + TN) / (TP + TN + FP + FN)
+        accuracy = tp + tn
+
+        return {
+            "accuracy": accuracy,
+            "f1_macro": f1,  # Pour binaire, macro = micro = weighted
+            "f1_weighted": f1,
+            "precision_macro": precision,
+            "recall_macro": recall,
+        }
+
+    elif len(unique_classes) > 2:
+        print("multiclasse"*150)
+        # On suppose que le classifieur aléatoire prédit uniformément
+        n_classes = len(unique_classes)
+        random_acc = 1.0 / n_classes
+
+        return {
+            "accuracy": random_acc,
+            "f1_macro": random_acc,
+            "f1_weighted": random_acc,
+            "precision_macro": random_acc,
+            "recall_macro": random_acc,
+        }
+    else:
+        return {
+            "accuracy": 0.5,
+            "f1_macro": 0.5,
+            "f1_weighted": 0.5,
+            "precision_macro": 0.5,
+            "recall_macro": 0.5,
+        }
 
 def main_run(config_file, just_return_first_model=False):
     start_time = time.time()
@@ -139,13 +215,7 @@ def main_run(config_file, just_return_first_model=False):
             if config_file.get("compute_shapley", False):
                 view_names = config_file["experiment"]["preprocess"]["view_names"]
                 method.set_missing_info(None, **config_file["training"].get("missing_method", {}))
-                baseline_metrics = { # under the assumption of random predictions and balanced classes
-                    "accuracy" : 0.5,
-                    "f1_macro" : 0.5,
-                    "f1_weighted" : 0.5,
-                    "precision_macro" : 0.5,
-                    "recall_macro" : 0.5,
-                }
+                baseline_metrics = _get_random_baseline_metrics(y_true, config_file.get("task_type"))
                 v_dict = {frozenset(): baseline_metrics} #empty set as baseline
                 v_dict[frozenset(view_names)] = metrics #full set
                 full_str = "_".join(sorted(view_names))
