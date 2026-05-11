@@ -129,6 +129,42 @@ def _get_random_baseline_metrics(y_true, task_type):
             "recall_macro": 0.5,
         }
 
+
+def inspect_data_structure(data_views, name=""):
+    """Version simple pour voir rapidement la structure."""
+    print(f"\n{'='*50}")
+    print(f"📊 {name}")
+    print(f"{'='*50}")
+    print(f"Échantillons: {len(data_views)}")
+    print(f"Vues: {data_views.view_names}")
+    
+    # Labels
+    labels = data_views.get_all_labels()
+    print(f"Labels shape: {labels.shape}")
+    if len(np.unique(labels)) <= 10:
+        unique, counts = np.unique(labels, return_counts=True)
+        print(f"Distribution: {dict(zip(unique, counts))}")
+    
+    # Structure interne
+    print(f"\nAttributs disponibles:")
+    for attr in ['data', 'views', 'X', 'features', 'samples']:
+        if hasattr(data_views, attr):
+            obj = getattr(data_views, attr)
+            print(f"  - {attr}: {type(obj)}")
+            if isinstance(obj, dict):
+                print(f"    Clés: {list(obj.keys())}")
+            elif hasattr(obj, 'shape'):
+                print(f"    Shape: {obj.shape}")
+    
+    # Afficher un échantillon
+    print(f"\nPremier échantillon (toutes vues confondues):")
+    for view_name in data_views.view_names:
+        # Essayer d'accéder aux données de la vue
+        if hasattr(data_views, 'data') and isinstance(data_views.data, dict) and view_name in data_views.data:
+            sample = data_views.data[view_name][0]
+            print(f"  {view_name}: {sample if not hasattr(sample, 'shape') else f'shape={sample.shape}'}")
+
+
 def main_run(config_file, just_return_first_model=False):
     start_time = time.time()
     input_dir_folder = config_file["input_dir_folder"]
@@ -138,7 +174,13 @@ def main_run(config_file, just_return_first_model=False):
     if len(runs_seed) == 0:
         runs = config_file["experiment"].get("runs", 1)
         runs_seed = [np.random.randint(50000) for _ in range(runs)]
-    
+
+
+    save_weights = config_file.get("save_weights", False)
+    save_test_set = config_file.get("save_test_set", True)
+    weights_dir = config_file.get("weights_dir", f"{output_dir_folder}/weights/{data_name}")
+    testset_dir = config_file.get("testset_dir", f"{output_dir_folder}/test_sets/{data_name}")
+
     BS = config_file["training"]["batch_size"]
     if "loss_args" not in config_file["training"]: 
         config_file["training"]["loss_args"] = {}
@@ -148,11 +190,15 @@ def main_run(config_file, just_return_first_model=False):
         config_file["training"]["loss_args"]["name"] = "bce" if "name" not in config_file["training"]["loss_args"] else config_file["training"]["loss_args"]["name"]
     method_name = assign_multifusion_name(config_file["training"],config_file["method"], more_info_str=config_file.get("additional_method_name", ""))
 
+    print(f"🔧 METHOD_NAME = '{method_name}'")
+
     if "train" in data_name:
         print("train in data name AAAAA"*150)
         data_views_tr = load_structure(input_dir_folder, data_name, load_memory=config_file.get("load_memory", False))
+        inspect_data_structure(data_views_tr, f"{data_name} (Training)")  # AAAAAAAA
         data_views_tr.load_stats(input_dir_folder, data_name)
         data_views_te = load_structure(input_dir_folder, data_name.replace("train", "test"), load_memory=config_file.get("load_memory", False))
+        inspect_data_structure(data_views_te, f"{data_name.replace('train', 'test')} (Test)") # AAAAAAAA
         data_views_te.load_stats(input_dir_folder, data_name)
         try:
             data_views_va = load_structure(input_dir_folder, data_name.replace("train", "val"), load_memory=config_file.get("load_memory", False))
@@ -163,12 +209,14 @@ def main_run(config_file, just_return_first_model=False):
         kfolds = 1
     else:
         data_views_tr = load_structure(input_dir_folder, data_name, load_memory=config_file.get("load_memory", False))
+        inspect_data_structure(data_views_tr, f"{data_name} (Full dataset)")  # AAAAAAAA
         data_views_tr.load_stats(input_dir_folder, data_name)
         kfolds = config_file["experiment"].get("kfolds", 2)
 
     metric_keys = ["accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]
     metadata_r = {"epoch_runs":[], "full_prediction_time":[], "training_time":[], "best_score":[],
                   **{k: [] for k in metric_keys}}
+
     for r,r_seed in enumerate(runs_seed):
         np.random.seed(r_seed)
         if kfolds != 1:
@@ -191,10 +239,53 @@ def main_run(config_file, just_return_first_model=False):
             if config_file.get("task_type", "").lower() in ["classification", "multilabel"]:
                 assign_labels_weights(config_file, data_views_tr)
 
+            if save_test_set and kfolds != 1:
+                testset_path = Path(f"{testset_dir}/{method_name}")
+                testset_path.mkdir(parents=True, exist_ok=True)
+                
+                # Sauvegarde des indices
+                np.save(testset_path / f"test_indices_run{r}_fold{k}.npy", indexs_runs[k])
+                
+                # Sauvegarde des labels (même si 2D, numpy gère)
+                test_labels = data_views_te.get_all_labels()
+                np.save(testset_path / f"test_labels_run{r}_fold{k}.npy", test_labels)
+                
+                # Sauvegarde des identifiants
+                test_ids = data_views_te.get_all_identifiers()
+                np.save(testset_path / f"test_identifiers_run{r}_fold{k}.npy", test_ids)
+                
+                print(f"Test set saved (numpy format) to {testset_path}")
+                print(f"   Labels shape: {test_labels.shape}")
+
             start_aux = time.time()
-            method, trainer = MultiFusion_train(data_views_tr, val_data=data_views_va,run_id=r,fold_id=k,method_name=method_name, **config_file)
+            method, trainer = MultiFusion_train(data_views_tr, val_data=data_views_va, run_id=r, fold_id=k, method_name=method_name, **config_file)
+
+            if save_weights:
+                weights_path = Path(f"{weights_dir}/{method_name}")
+                weights_path.mkdir(parents=True, exist_ok=True)
+                weights_file = weights_path / f"model_run{r}_fold{k}.pt"
+
+                state_dict = method.state_dict()
+
+                torch.save({
+                    'run_id': r,
+                    'fold_id': k,
+                    'model_state_dict': state_dict,  # ← correction ici
+                    'optimizer_state_dict': trainer.optimizer.state_dict() if hasattr(trainer, 'optimizer') else None,
+                    'best_score': trainer.callbacks[0].best_score.cpu() if hasattr(trainer, 'callbacks') else None,
+                    'epoch': trainer.callbacks[0].stopped_epoch if hasattr(trainer, 'callbacks') else None,
+                    'config': config_file,
+                    'seed': r_seed,
+                    'test_indices_file': str(testset_path / f"test_indices_run{r}_fold{k}.npy") if save_test_set else None,
+                    'test_labels_file': str(testset_path / f"test_labels_run{r}_fold{k}.npy") if save_test_set else None,
+                }, weights_file)
+            
+                print(f"Model weights saved to {weights_file}")
+
             if just_return_first_model:
                 return method
+
+
             metadata_r["training_time"].append(time.time()-start_aux)
             metadata_r["epoch_runs"].append(trainer.callbacks[0].stopped_epoch)
             metadata_r["best_score"].append(trainer.callbacks[0].best_score.cpu())
