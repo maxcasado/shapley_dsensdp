@@ -24,12 +24,10 @@ import torch
 import yaml
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-
 print("Imports standards OK", flush=True)
 
 try:
     from code.training.learn_pipeline import MultiFusion_train
-    from code.training.learn_pipeline import build_model
     from code.training.utils import assign_multifusion_name, output_name, assign_labels_weights
     from code.datasets.views_structure import Dataset_MultiView
     from code.datasets.utils import create_dataloader, load_structure
@@ -154,7 +152,8 @@ def _print_metrics(metrics: dict, title: str = "Metriques"):
 # ==============================================================================
 
 def _build_model(checkpoint: dict, config: dict):
-    import copy
+    from code.training.learn_pipeline import build_model
+
     cfg = copy.deepcopy(config)
     input_dir = cfg["input_dir_folder"]
     data_name = cfg["data_name"]
@@ -168,13 +167,13 @@ def _build_model(checkpoint: dict, config: dict):
         assign_labels_weights(cfg, data_views)
 
     log("  Construction du modele (sans entrainement)...")
-    model = build_model(data_views, **cfg)
+    method = build_model(data_views, **cfg)
 
     log("  Chargement du state_dict...")
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
+    method.load_state_dict(checkpoint["model_state_dict"])
+    method.eval()
     log("  State-dict charge.")
-    return model
+    return method
 
 
 # ==============================================================================
@@ -246,6 +245,181 @@ def _save_results_csv(
 # ==============================================================================
 #  Point d'entree
 # ==============================================================================
+
+def _infer_subset(method, data_te, subset_list, batch_size, task_type):
+    """
+    Lance l'inference en n'utilisant que les vues de subset_list.
+    Retourne les logits bruts (n_samples,) ou (n_samples, n_classes).
+    """
+    with torch.no_grad():
+        out = method.transform(
+            create_dataloader(data_te, batch_size=batch_size, train=False),
+            out_norm=None,
+            args_forward={
+                "inference_views": subset_list,
+                "missing_method":  method.missing_method,
+            },
+            perc_forward=1.0,
+            not_return_repre=True,
+        )
+    return out["prediction"]
+
+
+def shapley_bbox_per_point(
+    method,
+    data_te,
+    ckpt_config,
+    coords,
+    lon_min, lon_max,
+    lat_min, lat_max,
+    batch_size=32,
+    out_csv=None,
+):
+    """
+    Pour chaque point dans la bounding box, calcule les valeurs de Shapley
+    en utilisant le logit predit comme valeur du jeu caracteristique.
+
+    Pour chaque sous-ensemble S de vues, le modele est relance en obstruant
+    les vues absentes de S. La valeur v(S, x) est le logit du point x.
+
+    Parametres
+    ----------
+    method      : modele charge (apres load_state_dict)
+    data_te     : Dataset_MultiView du test set
+    ckpt_config : config du checkpoint
+    coords      : np.array (n_samples, 2) -> colonnes [longitude, latitude]
+                  dans le meme ordre que les echantillons de data_te
+    lon_min/max : bornes longitude
+    lat_min/max : bornes latitude
+    batch_size  : batch size pour l'inference
+    out_csv     : chemin CSV de sauvegarde (None = pas de sauvegarde)
+
+    Retourne
+    --------
+    pd.DataFrame : une ligne par point, colonnes sample_idx / lon / lat /
+                   <vue>_shapley pour chaque vue
+    """
+    task_type  = ckpt_config.get("task_type", "")
+    view_names = ckpt_config["experiment"]["preprocess"]["view_names"]
+    n_views    = len(view_names)
+    n_samples  = len(data_te)
+
+    assert len(coords) == n_samples, (
+        f"coords a {len(coords)} lignes mais data_te a {n_samples} echantillons."
+    )
+
+    # ---- filtrage bounding box ------------------------------------------------
+    lons = coords[:, 0]
+    lats = coords[:, 1]
+    mask = (
+        (lons >= lon_min) & (lons <= lon_max) &
+        (lats >= lat_min) & (lats <= lat_max)
+    )
+    bbox_idx = np.where(mask)[0]
+    n_bbox   = len(bbox_idx)
+
+    if n_bbox == 0:
+        log("Aucun point dans la bounding box.")
+        return pd.DataFrame()
+
+    log(f"{n_bbox} points dans la bounding box (sur {n_samples} total).")
+
+    # ---- inference par sous-ensemble -----------------------------------------
+    # On lance l'inference sur tout le dataset et on filtre ensuite par bbox_idx.
+    # v(vide, x) = 0 par convention.
+    # Pour le multiclasse, la classe de reference est fixee par la prediction
+    # du modele complet (toutes les vues), point par point.
+
+    all_subsets   = []
+    all_subset_fs = []
+    for size in range(1, n_views + 1):
+        for combo in itertools.combinations(view_names, size):
+            all_subsets.append(list(combo))
+            all_subset_fs.append(frozenset(combo))
+
+    n_subsets = len(all_subsets)
+    log(f"Lancement de {n_subsets} passes d'inference ({n_views} vues, "
+        f"2^{n_views}-1 sous-ensembles)...")
+
+    # Dictionnaire frozenset -> logits de shape (n_bbox,)
+    v_dict = {frozenset(): np.zeros(n_bbox, dtype=np.float64)}
+    ref_class = None  # determine lors de la passe complete
+
+    for i, (subset_list, subset_fs) in enumerate(zip(all_subsets, all_subset_fs)):
+        label = "+".join(subset_list)
+        log(f"  [{i+1}/{n_subsets}] {label}")
+
+        logits_all  = _infer_subset(method, data_te, subset_list, batch_size, task_type)
+        logits_bbox = logits_all[bbox_idx]
+
+        # Pour le multiclasse : extraire le logit de la classe de reference
+        if logits_bbox.ndim > 1:
+            if subset_fs == frozenset(view_names):
+                # Passe complete : on fixe la classe de reference
+                ref_class = logits_bbox.argmax(axis=-1)   # (n_bbox,)
+            if ref_class is not None:
+                logits_bbox = logits_bbox[np.arange(n_bbox), ref_class]
+            else:
+                # Passe complete pas encore faite : on stocke temporairement
+                # le max comme proxy (sera ecrase apres si besoin)
+                logits_bbox = logits_bbox.max(axis=-1)
+
+        v_dict[subset_fs] = logits_bbox.astype(np.float64)
+
+    # Si la passe complete n'etait pas la derniere dans la boucle, on recalcule
+    # les sous-ensembles qui ont ete evalues avant que ref_class soit connu.
+    # (Cas rare : n'arrive que si frozenset(view_names) n'est pas le dernier.)
+    # Dans la boucle ci-dessus, frozenset(view_names) est toujours le dernier
+    # puisque size va de 1 a n_views. Pas de recalcul necessaire.
+
+    # ---- valeurs de Shapley par point ----------------------------------------
+    log("Calcul des valeurs de Shapley par point...")
+    shapley_matrix = np.zeros((n_bbox, n_views), dtype=np.float64)
+
+    for j, view in enumerate(view_names):
+        others = [v for v in view_names if v != view]
+        phi    = np.zeros(n_bbox, dtype=np.float64)
+        for size in range(len(others) + 1):
+            for S_tuple in itertools.combinations(others, size):
+                S      = frozenset(S_tuple)
+                s      = len(S)
+                weight = (math.factorial(s) * math.factorial(n_views - s - 1)
+                          / math.factorial(n_views))
+                phi   += weight * (v_dict[S | {view}] - v_dict[S])
+        shapley_matrix[:, j] = phi
+
+    # ---- construction du DataFrame -------------------------------------------
+    df_dict = {
+        "sample_idx": bbox_idx,
+        "lon":        lons[bbox_idx],
+        "lat":        lats[bbox_idx],
+    }
+    for j, view in enumerate(view_names):
+        df_dict[f"{view}_shapley"] = shapley_matrix[:, j]
+
+    df = pd.DataFrame(df_dict)
+
+    if out_csv is not None:
+        out_path = Path(out_csv)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_path, index=False)
+        log(f"Resultats sauvegardes -> {out_path}")
+
+    # ---- resume --------------------------------------------------------------
+    sep = "-" * 48
+    log(f"\n{sep}")
+    log(f"  Shapley moyen sur la bounding box ({n_bbox} points)")
+    log(sep)
+    for view in view_names:
+        col  = f"{view}_shapley"
+        mean = df[col].mean()
+        std  = df[col].std()
+        sign = "+" if mean >= 0 else ""
+        log(f"  {view:<20} {sign}{mean:.4f}  (+/- {std:.4f})")
+    log(sep)
+
+    return df
+
 
 def run_inference(args):
 
