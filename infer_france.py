@@ -39,10 +39,14 @@ except Exception:
     sys.exit(1)
 
 # Bounding box France metropolitaine
-FRANCE_LON_MIN = -5.5
-FRANCE_LON_MAX =  9.5
-FRANCE_LAT_MIN = 41.0
-FRANCE_LAT_MAX = 51.5
+# FRANCE_LON_MIN = -5.5
+# FRANCE_LON_MAX =  9.5
+# FRANCE_LAT_MIN = 41.0
+# FRANCE_LAT_MAX = 51.5
+FRANCE_LON_MIN = -180
+FRANCE_LON_MAX =  180
+FRANCE_LAT_MIN = -90
+FRANCE_LAT_MAX = 90
 
 NC_PATH = "/home/casado/DsensDp/data/out/cropharvest_binary.nc"
 
@@ -223,18 +227,19 @@ def plot_shapley_maps(df, view_names, out_dir, lon_min, lon_max, lat_min, lat_ma
 
     n_views = len(view_names)
 
-    # --- figure combinee ---
+    # figure combinee
     fig, axes = plt.subplots(2, 2, figsize=(12, 9), gridspec_kw={"hspace": 0.1, "wspace": 0.35})#
     axes = axes.flatten()
+
+    vmax = max(df[f"{view}_shapley"].abs().max() for view in view_names)
 
     for ax, view in zip(axes, view_names):
         col    = f"{view}_shapley"
         values = df[col].values
-        vmax   = np.abs(values).max()
         _draw(ax)
-        sc = ax.scatter(df["lon"], df["lat"], c=values, cmap="RdBu_r",
-                        vmin=-vmax, vmax=vmax, s=12, linewidths=0)
-        plt.colorbar(sc, ax=ax, fraction=0.03, pad=0.04, label="Shapley value")
+        sc = ax.scatter(df["lon"], df["lat"], c=np.abs(values), cmap="RdBu_r",
+                        vmin=0, vmax=vmax, s=12, linewidths=0)
+        plt.colorbar(sc, ax=ax, fraction=0.03, pad=0.04, label="|Shapley value|")
         ax.set_title(view, fontsize=13)
 
     fig.suptitle("Valeurs de Shapley par modalite", fontsize=15, y=0.90)
@@ -244,7 +249,7 @@ def plot_shapley_maps(df, view_names, out_dir, lon_min, lon_max, lat_min, lat_ma
     plt.close()
     log(f"Carte combinee sauvegardee -> {out_path}")
 
-    # --- une figure par modalite ---
+    # figures par modalite
     for view in view_names:
         col    = f"{view}_shapley"
         values = df[col].values
@@ -252,9 +257,9 @@ def plot_shapley_maps(df, view_names, out_dir, lon_min, lon_max, lat_min, lat_ma
 
         fig, ax = plt.subplots(figsize=(6, 7))
         _draw(ax)
-        sc = ax.scatter(df["lon"], df["lat"], c=values, cmap="RdBu_r",
-                        vmin=-vmax, vmax=vmax, s=14, linewidths=0)
-        plt.colorbar(sc, ax=ax, label="Shapley value")
+        sc = ax.scatter(df["lon"], df["lat"], c=np.abs(values), cmap="RdBu_r",
+                        vmin=0, vmax=vmax, s=14, linewidths=0)
+        plt.colorbar(sc, ax=ax, label="|Shapley value|")
         ax.set_title(f"Shapley - {view}", fontsize=13)
         plt.tight_layout()
 
@@ -313,7 +318,6 @@ def main(args):
 
     coords = build_coords(data_te, nc_path=args.nc_path)
 
-    # Filtrage France
     lons = coords[:, 0]
     lats = coords[:, 1]
     mask = (
@@ -340,7 +344,6 @@ def main(args):
     shapley_matrix = compute_shapley(method, data_te, bbox_idx, batch_size, task_type, view_names)
     log(f"  Termine en {time.time() - t0:.1f}s")
 
-    # Construction du DataFrame
     ids_bbox = data_te.get_all_identifiers()[bbox_idx]
     df_dict  = {
         "sample_idx": bbox_idx,
@@ -363,6 +366,26 @@ def main(args):
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(csv_path, index=False)
     log(f"\nCSV sauvegarde -> {csv_path}")
+
+    # Export geospatial
+    if args.geo_format:
+        try:
+            import geopandas as gpd
+            from shapely.geometry import Point
+            gdf = gpd.GeoDataFrame(
+                df,
+                geometry=[Point(lon, lat) for lon, lat in zip(df["lon"], df["lat"])],
+                crs="EPSG:4326",
+            )
+            if args.geo_format == "gpkg":
+                geo_path = Path(args.out_dir) / "shapley_france.gpkg"
+                gdf.to_file(geo_path, driver="GPKG")
+            elif args.geo_format == "geojson":
+                geo_path = Path(args.out_dir) / "shapley_france.geojson"
+                gdf.to_file(geo_path, driver="GeoJSON")
+            log(f"Export geospatial sauvegarde -> {geo_path}")
+        except ImportError:
+            log("AVERTISSEMENT : geopandas/shapely non disponible, export geospatial ignore.")
 
     sep = "-" * 48
     log(f"\n{sep}")
@@ -399,6 +422,8 @@ def parse_args():
     p.add_argument("--lon_max", type=float, default=FRANCE_LON_MAX)
     p.add_argument("--lat_min", type=float, default=FRANCE_LAT_MIN)
     p.add_argument("--lat_max", type=float, default=FRANCE_LAT_MAX)
+    p.add_argument("--geo_format", choices=["gpkg", "geojson"], default=None,
+                   help="Format d'export geospatial (gpkg ou geojson, optionnel)")
     return p.parse_args()
 
 
