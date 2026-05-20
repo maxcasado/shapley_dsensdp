@@ -7,7 +7,7 @@ data_name: cropharvest_binary
 task_type: classification
 
 save_weights: True 
-save_test_set : True
+save_test_set: True
 weights_dir: ./res_out/weights
 testset_dir: ./res_out/test_sets
 
