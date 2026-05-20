@@ -3,11 +3,12 @@ Shapley value computation for multi-sensor/multi-view models.
 
 Public API
 ----------
-shapley_values             : pure cooperative game theory formula (scalar v_dict).
-run_subset_inference       : run all 2^N-1 subset inferences, build metric v_dict.
-compute_shapley_per_metric : aggregate v_dict → {metric: {view: phi}}.
-compute_shapley_fold       : end-to-end helper for train_multi; returns flat dict
-                             ready to extend metadata_r.
+shapley_values                      : pure cooperative game theory formula (scalar v_dict).
+run_subset_inference                : run all 2^N-1 subset inferences, build metric v_dict.
+compute_shapley_per_metric          : aggregate v_dict → {metric: {view: phi}}.
+compute_shapley_interactions_metrics: SII order-2 from a metric-based v_dict.
+compute_shapley_fold                : end-to-end helper for train_multi; returns flat dict
+                                      ready to extend metadata_r.
 """
 import math
 import itertools
@@ -135,6 +136,59 @@ def compute_shapley_per_metric(
     for metric_name in metric_keys:
         v_scalar = {s: v_dict[s][metric_name] for s in v_dict}
         result[metric_name] = shapley_values(view_names, v_scalar)
+    return result
+
+
+# ── Shapley Interaction Index — metric-based (scalar) ────────────────────────
+
+def compute_shapley_interactions_metrics(
+    v_dict: dict,
+    view_names: list,
+    metric_keys: list,
+) -> dict:
+    """
+    Compute the Shapley Interaction Index (SII) order-2 for all view pairs,
+    using scalar metric values as the characteristic function.
+
+    SII(i,j) = Σ_{S ⊆ N\\{i,j}} w(|S|) · Δ_{ij}(S)
+    Δ_{ij}(S) = v(S∪{i,j}) - v(S∪{i}) - v(S∪{j}) + v(S)
+    w(s)      = s! · (n-s-2)! / (n-1)!
+
+    Args:
+        v_dict:      {frozenset → metrics_dict} from run_subset_inference.
+                     Must contain all 2^N coalitions (∅ included).
+        view_names:  Full list of view names.
+        metric_keys: Metrics to compute SII for.
+
+    Returns:
+        {metric_name: {(view_i, view_j): sii_value}}
+        Only the upper triangle is stored (i < j); the index is a tuple of names.
+    """
+    n      = len(view_names)
+    result = {}
+
+    for metric_name in metric_keys:
+        sii = {}
+        for i, vi in enumerate(view_names):
+            for j, vj in enumerate(view_names):
+                if j <= i:
+                    continue
+                others = [v for v in view_names if v not in (vi, vj)]
+                phi_ij = 0.0
+                for size in range(len(others) + 1):
+                    for S_tuple in itertools.combinations(others, size):
+                        S      = frozenset(S_tuple)
+                        s      = len(S)
+                        weight = (math.factorial(s) * math.factorial(n - s - 2)
+                                  / math.factorial(n - 1))
+                        delta  = (v_dict[S | {vi, vj}][metric_name]
+                                  - v_dict[S | {vi}][metric_name]
+                                  - v_dict[S | {vj}][metric_name]
+                                  + v_dict[S][metric_name])
+                        phi_ij += weight * delta
+                sii[(vi, vj)] = phi_ij
+        result[metric_name] = sii
+
     return result
 
 
