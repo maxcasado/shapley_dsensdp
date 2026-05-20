@@ -3,7 +3,6 @@ input_dir_folder: /home/casado/DsensDp/data/out/
 additional_method_name: -Plus
 
 load_memory: True
-compute_shapley: True
 data_name: cropharvest_binary
 task_type: classification
 
