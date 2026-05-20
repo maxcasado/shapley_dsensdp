@@ -1,3 +1,7 @@
 res_out/
 lightning_logs/
 preds/
+__pycache__/
+*.pyc
+*.pt
+*.npy
