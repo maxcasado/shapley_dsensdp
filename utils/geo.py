@@ -112,3 +112,44 @@ def assign_continents(lons: np.ndarray, lats: np.ndarray) -> np.ndarray:
         )
         continents[mask] = name
     return continents
+
+
+# ── Climate zone assignment ────────────────────────────────────────────────────
+
+# Latitude boundaries (degrees)
+_TROPICAL_LAT   = 23.5    # Tropic of Cancer / Capricorn
+_SUBTROPICAL_LAT = 35.0
+_TEMPERATE_LAT  = 60.0
+# Above 60° = polar/boreal
+
+
+def assign_climate_zones(lats: np.ndarray) -> np.ndarray:
+    """
+    Assign a broad climate zone to each point based on absolute latitude.
+
+    Zones:
+        Tropical    |lat| <= 23.5°   (between tropics — high cloud cover, dense vegetation)
+        Subtropical 23.5° < |lat| <= 35°
+        Temperate   35° < |lat| <= 60°
+        Polar/Boreal |lat| > 60°
+
+    Args:
+        lats: Array of latitudes.
+
+    Returns:
+        Array of zone name strings.
+    """
+    abs_lat = np.abs(lats)
+    zones   = np.full(len(lats), "Polar/Boreal", dtype=object)
+    zones[abs_lat <= _TEMPERATE_LAT]  = "Temperate"
+    zones[abs_lat <= _SUBTROPICAL_LAT] = "Subtropical"
+    zones[abs_lat <= _TROPICAL_LAT]   = "Tropical"
+    return zones
+
+
+def assign_tropical_flag(lats: np.ndarray) -> np.ndarray:
+    """
+    Binary flag: True if tropical (|lat| <= 23.5°), False otherwise.
+    Simpler alternative to assign_climate_zones for two-group comparisons.
+    """
+    return np.abs(lats) <= _TROPICAL_LAT

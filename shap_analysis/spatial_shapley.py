@@ -106,15 +106,22 @@ def compute_spatial_shapley(
         logits_all  = _infer_subset(method, data_te, subset_list, batch_size)
         logits_bbox = logits_all[bbox_idx]
 
-        # Multiclass: project onto reference class from the full-view prediction
         if logits_bbox.ndim > 1:
-            fs = frozenset(subset_list)
-            if fs == frozenset(view_names):
-                ref_class = logits_bbox.argmax(axis=-1)        # (n_bbox,)
-            if ref_class is not None:
-                logits_bbox = logits_bbox[np.arange(n_bbox), ref_class]
+            n_classes = logits_bbox.shape[1]
+            if n_classes == 2:
+                # Binary classification: always use class 1 (positive/crop)
+                # so that v(S, x) = P(crop | S) and pred_score is directly
+                # comparable to a 0.5 threshold.
+                logits_bbox = logits_bbox[:, 1]
             else:
-                logits_bbox = logits_bbox.max(axis=-1)         # temporary proxy
+                # Multiclass: project onto the class predicted by the full model
+                fs = frozenset(subset_list)
+                if fs == frozenset(view_names):
+                    ref_class = logits_bbox.argmax(axis=-1)    # (n_bbox,)
+                if ref_class is not None:
+                    logits_bbox = logits_bbox[np.arange(n_bbox), ref_class]
+                else:
+                    logits_bbox = logits_bbox.max(axis=-1)     # temporary proxy
 
         v_dict[frozenset(subset_list)] = logits_bbox.astype(np.float64)
         print(f"    [{i+1}/{n_subsets}] {label}", flush=True)

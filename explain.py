@@ -32,8 +32,10 @@ print("Standard imports OK", flush=True)
 
 try:
     from utils.checkpoint import build_model, load_test_data, resolve_weights_path
-    from utils.geo import assign_continents
+    from utils.geo import assign_continents, assign_climate_zones
     from shap_analysis.spatial_shapley import compute_spatial_shapley, compute_shapley_interactions
+    from shap_analysis.regimes import find_optimal_k, compute_regimes
+    from shap_analysis.subpopulations import find_optimal_k_gmm, compute_subpopulations
     from visualize.maps import (
         plot_shapley_maps,
         plot_gt_pred_maps,
@@ -42,6 +44,16 @@ try:
         plot_interaction_maps,
         plot_interaction_matrix,
         compute_stats,
+        plot_dominant_modality_by_continent,
+        plot_regime_map,
+        plot_regime_profiles,
+        plot_regime_continent,
+        plot_regime_silhouette,
+        plot_tropical_comparison,
+        plot_sii_by_climate_zone,
+        plot_phi_vs_performance,
+        plot_subpopulation_profiles,
+        plot_subpop_k_selection,
     )
     print("Project imports OK", flush=True)
 except Exception:
@@ -230,10 +242,12 @@ def main(args):
 
     # ── Enrichment ────────────────────────────────────────────────────────────
     log("\nAssigning continents...")
-    df["continent"] = assign_continents(df["lon"].values, df["lat"].values)
+    df["continent"]    = assign_continents(df["lon"].values, df["lat"].values)
+    df["climate_zone"] = assign_climate_zones(df["lat"].values)
 
     if "label" in df.columns and "pred_score" in df.columns:
-        pred_class    = (df["pred_score"].values >= 0.5).astype(int)
+        # pred_score is a log-odds (1D model output), decision boundary at 0
+        pred_class    = (df["pred_score"].values > 0).astype(int)
         df["correct"] = pred_class == df["label"].values.astype(int)
 
     # ── Save CSV ──────────────────────────────────────────────────────────────
@@ -270,6 +284,45 @@ def main(args):
     log("\nComputing grouped statistics...")
     compute_stats(df, view_names, out_dir=out_root)
     plot_continent_map(df, out_dir=out_root, **bbox_kw)
+    plot_dominant_modality_by_continent(df, view_names, out_dir=out_root / "stats")
+
+    log("\nAnalysing tropical vs non-tropical contributions...")
+    plot_tropical_comparison(df, view_names,
+                             out_dir=out_root / "tropical" / "abs",
+                             signed=False, **bbox_kw)
+    plot_tropical_comparison(df, view_names,
+                             out_dir=out_root / "tropical" / "signed",
+                             signed=True, **bbox_kw)
+
+    log("\nComputing SII by climate zone...")
+    plot_sii_by_climate_zone(df, shapley_matrix, interaction_matrix,
+                             view_names, out_dir=out_root / "tropical" / "sii_by_zone")
+
+    log("\nCorrelation φ vs local performance...")
+    plot_phi_vs_performance(df, view_names,
+                            out_dir=out_root / "performance")
+
+    # ── Subpopulation discovery via GMM ──────────────────────────────────────
+    if args.subpopulations:
+        dir_subpop  = out_root / "subpopulations"
+        phi_matrix  = df[[f"{v}_shapley" for v in view_names]].values
+
+        if args.n_subpop:
+            k = args.n_subpop
+            log(f"\nComputing {k} subpopulations (--n_subpop).")
+        else:
+            log("\nSelecting optimal number of subpopulations (GMM BIC)...")
+            k_analysis = find_optimal_k_gmm(phi_matrix, k_range=range(2, 9))
+            plot_subpop_k_selection(k_analysis, out_dir=dir_subpop)
+            k = k_analysis["recommended_k"]
+            log(f"\nSelected k={k} by BIC.")
+
+        log(f"\nFitting GMM with k={k}...")
+        df = compute_subpopulations(df, view_names, k=k)
+        df.to_csv(out_root / "shapley_spatial.csv", index=False)
+        log("CSV updated with subpopulation labels.")
+
+        plot_subpopulation_profiles(df, view_names, out_dir=dir_subpop)
 
     log("\nGenerating GT / prediction maps...")
     plot_gt_pred_maps(df, out_dir=dir_gt_pred, **bbox_kw)
@@ -281,6 +334,29 @@ def main(args):
     plot_interaction_graph(shapley_matrix, interaction_matrix, view_names, out_dir=dir_interact)
     plot_interaction_maps(df, interaction_matrix, view_names, out_dir=dir_interact, **bbox_kw)
     plot_interaction_matrix(shapley_matrix, interaction_matrix, view_names, out_dir=dir_interact)
+
+    # ── Sensor regime analysis (optional) ────────────────────────────────────
+    if args.regimes:
+        dir_regimes = out_root / "regimes"
+        phi_matrix  = df[[f"{v}_shapley" for v in view_names]].values
+
+        if args.n_regimes:
+            k = args.n_regimes
+            log(f"\nUsing k={k} regimes (--n_regimes).")
+        else:
+            log("\nSelecting optimal number of regimes...")
+            k_analysis = find_optimal_k(phi_matrix, k_range=range(2, min(9, len(df))))
+            plot_regime_silhouette(k_analysis, out_dir=dir_regimes)
+            k = k_analysis["best_k"]
+            log(f"\nSelected k={k} by silhouette score.")
+        df = compute_regimes(df, view_names, k=k)
+
+        df.to_csv(csv_path, index=False)  # update CSV with regime column
+        log(f"CSV updated with regime labels -> {csv_path}")
+
+        plot_regime_map(df, out_dir=dir_regimes, **bbox_kw)
+        plot_regime_profiles(df, view_names, out_dir=dir_regimes)
+        plot_regime_continent(df, out_dir=dir_regimes)
 
     log(f"\nDone. Output structure:")
     log(f"  {out_root}/")
@@ -319,6 +395,15 @@ def parse_args():
     p.add_argument("--lat_min", type=float, default=DEFAULT_LAT_MIN)
     p.add_argument("--lat_max", type=float, default=DEFAULT_LAT_MAX)
     p.add_argument("--geo_format", choices=["gpkg", "geojson"], default=None)
+    p.add_argument("--regimes", action="store_true",
+                   help="Run sensor regime analysis (KMeans on Shapley profiles).")
+    p.add_argument("--n_regimes", type=int, default=None,
+                   help="Number of regimes (k). If not set, selected automatically "
+                        "by silhouette score.")
+    p.add_argument("--subpopulations", action="store_true",
+                   help="Run subpopulation discovery (GMM on signed φ profiles).")
+    p.add_argument("--n_subpop", type=int, default=None,
+                   help="Number of subpopulations. If not set, selected by BIC.")
 
     args = p.parse_args()
 

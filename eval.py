@@ -35,6 +35,7 @@ try:
     from shap_analysis.shapley import (run_subset_inference,
                                        compute_shapley_per_metric,
                                        compute_shapley_interactions_metrics)
+    from visualize.maps import plot_sii_matrix, plot_shapley_barplot, plot_sii_barplot
     print("Project imports OK", flush=True)
 except Exception:
     print(f"\nImport error:\n{traceback.format_exc()}", flush=True)
@@ -330,6 +331,75 @@ def run_inference(args):
     if len(fold_ids) > 1:
         _print_aggregated(all_metrics, all_shapley, all_interactions)
         _save_aggregated_csv(out_dir, run_id, all_metrics, all_shapley, all_interactions)
+
+    # ── Shapley values plots ──────────────────────────────────────────────────
+    if all_shapley:
+        n_folds      = len(all_shapley)
+        suffix       = f"mean ± std over {n_folds} fold(s)" if n_folds > 1 else f"fold {fold_ids[0]}"
+        values_dir   = out_dir / "values"
+        plot_shapley_barplot(all_shapley, sorted(
+            {row["view"] for fold in all_shapley for row in fold}
+        ), values_dir, title_suffix=suffix)
+
+    # ── SII matrix + barplot ──────────────────────────────────────────────────
+    if all_interactions:
+        all_rows   = [row for fold in all_interactions for row in fold]
+        view_names = sorted({row["view_i"] for row in all_rows} |
+                            {row["view_j"] for row in all_rows})
+        n_folds    = len(all_interactions)
+        suffix     = f"mean ± std over {n_folds} fold(s)" if n_folds > 1 else f"fold {fold_ids[0]}"
+        inter_dir  = out_dir / "interactions"
+
+        # Barplot
+        plot_sii_barplot(all_interactions, inter_dir, title_suffix=suffix)
+
+        # Matrix
+        # Matrix — build shapley_values dict for diagonal if available
+        sv_for_diag = None
+        if all_shapley:
+            df_sv = pd.concat(
+                [pd.DataFrame(s) for s in all_shapley], ignore_index=True
+            )
+            if len(fold_ids) > 1:
+                sv_for_diag = {}
+                for metric_name, grp in df_sv.groupby("metric"):
+                    sv_for_diag[metric_name] = {
+                        row["view"]: {"mean": row["mean"], "std": row["std"]}
+                        for _, row in grp.groupby("view")["shapley_value"]
+                        .agg(mean="mean", std="std")
+                        .reset_index()
+                        .iterrows()
+                    }
+            else:
+                sv_for_diag = {}
+                for row in all_shapley[0]:
+                    sv_for_diag.setdefault(row["metric"], {})[row["view"]] = row["shapley_value"]
+
+        if len(fold_ids) > 1:
+            df_sii = pd.concat(
+                [pd.DataFrame(s) for s in all_interactions], ignore_index=True
+            )
+            sii_agg = {}
+            for metric_name, grp in df_sii.groupby("metric"):
+                sii_agg[metric_name] = {
+                    (row["view_i"], row["view_j"]): {
+                        "mean": row["mean"], "std": row["std"]
+                    }
+                    for _, row in grp.groupby(["view_i", "view_j"])["sii_value"]
+                    .agg(mean="mean", std="std")
+                    .reset_index()
+                    .iterrows()
+                }
+            plot_sii_matrix(sii_agg, view_names, inter_dir,
+                            title_suffix=suffix, shapley_values=sv_for_diag)
+        else:
+            sii_scalar = {}
+            for row in all_interactions[0]:
+                m = row["metric"]
+                sii_scalar.setdefault(m, {})[(row["view_i"], row["view_j"])] = row["sii_value"]
+            plot_sii_matrix(sii_scalar, view_names, inter_dir,
+                            title_suffix=f"fold {fold_ids[0]}",
+                            shapley_values=sv_for_diag)
 
     log("\nDone.")
     return all_metrics
