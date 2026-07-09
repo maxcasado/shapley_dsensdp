@@ -231,7 +231,7 @@ class Dataset_MultiView(Dataset):
                 view_data["year"] = data_
                 continue
             
-            if self.stats_xarray is not None:
+            if self.stats_xarray is not None and view != "geo":
                 data_ = self.normalize_w_stats(data_, view)
             if self.fillnan:
                 data_ = np.nan_to_num(data_, nan=self.fillnan_value)
@@ -256,7 +256,7 @@ class Dataset_MultiView(Dataset):
         return self.view_names if len(indexs) == 0 else np.asarray(self.view_names)[indexs].tolist()
 
     def get_view_shapes(self, view_name:str ="") -> Dict[str, tuple]:
-        return_dic = {name: self.views_data[name].shape[1:] for name in self.view_names}
+        return_dic = {name: self.views_data[name].shape[1:] for name in self.view_names if name in self.views_data}
         if view_name in return_dic:
             return return_dic[view_name]
         elif "_" in view_name:

@@ -109,13 +109,11 @@ CONTINENT_COLORS = {
 # ── Shapley maps ──────────────────────────────────────────────────────────────
 
 def plot_shapley_maps(df: pd.DataFrame, view_names: list, out_dir,
-                      lon_min, lon_max, lat_min, lat_max, resolution: float = None):
+                      lon_min, lon_max, lat_min, lat_max,
+                      resolution: float = 2.0):
     """
-    Shapley maps using rasterized scatter (rasterized=True, s=0.5, dpi=600).
-
-    Each point keeps its exact Shapley value — no averaging or binning.
-    matplotlib renders the scatter as a bitmap at save time, so overlapping
-    points cost nothing and the file stays small.
+    Shapley maps using pcolormesh on a regular grid (mean per cell).
+    resolution: grid cell size in degrees (default 2.0°).
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -123,44 +121,109 @@ def plot_shapley_maps(df: pd.DataFrame, view_names: list, out_dir,
 
     lons = df["lon"].values
     lats = df["lat"].values
-    vmax = max(df[f"{v}_shapley"].abs().max() for v in view_names)
 
-    rng = np.random.default_rng(0)
-    idx = rng.permutation(len(df))
+    def _to_grid(values, res):
+        lon_edges = np.arange(-180, 180 + res, res)
+        lat_edges = np.arange(-90,   90 + res, res)
+        n_lon = len(lon_edges) - 1
+        n_lat = len(lat_edges) - 1
+        lon_idx = np.clip(np.digitize(lons, lon_edges) - 1, 0, n_lon - 1)
+        lat_idx = np.clip(np.digitize(lats, lat_edges) - 1, 0, n_lat - 1)
+        flat    = lon_idx * n_lat + lat_idx
+        valid   = ~np.isnan(values)
+        gs  = np.bincount(flat[valid], weights=values[valid],
+                          minlength=n_lon * n_lat).reshape(n_lon, n_lat)
+        gs2 = np.bincount(flat[valid], weights=values[valid]**2,
+                          minlength=n_lon * n_lat).reshape(n_lon, n_lat)
+        gc  = np.bincount(flat[valid], minlength=n_lon * n_lat).reshape(n_lon, n_lat)
+        mean = np.where(gc > 0, gs / gc, np.nan)
+        # std = sqrt(E[x²] - E[x]²), only for cells with >=2 points
+        std  = np.where(gc >= 2,
+                        np.sqrt(np.maximum(gs2 / gc - (gs / gc)**2, 0)),
+                        np.nan)
+        lc  = (lon_edges[:-1] + lon_edges[1:]) / 2
+        ltc = (lat_edges[:-1] + lat_edges[1:]) / 2
+        return mean, std, lc, ltc
 
-    # ── Combined figure ───────────────────────────────────────────────────────
+    vmax = max(np.nanpercentile(df[f"{v}_shapley"].abs().values, 98)
+               for v in view_names)
+
+    # ── Combined mean figure ──────────────────────────────────────────────────
     fig, axes = plt.subplots(2, 2, figsize=(12, 9),
                              gridspec_kw={"hspace": 0.25, "wspace": 0.35})
     axes = axes.flatten()
     for ax, view in zip(axes, view_names):
         values = df[f"{view}_shapley"].abs().values
+        mean, std, lc, ltc = _to_grid(values, resolution)
         _setup_ax(ax, borders, view, lon_min, lon_max, lat_min, lat_max)
-        sc = ax.scatter(lons[idx], lats[idx], c=values[idx],
-                        cmap="plasma", vmin=0, vmax=vmax,
-                        s=0.5, linewidths=0, rasterized=True)
-        plt.colorbar(sc, ax=ax, fraction=0.03, shrink=0.6, pad=0.04,
-                     label="|Shapley value|")
-    fig.suptitle("Shapley values per modality", fontsize=15, y=0.98)
+        pc = ax.pcolormesh(lc, ltc, mean.T, cmap="plasma",
+                           vmin=0, vmax=vmax, shading="auto")
+        plt.colorbar(pc, ax=ax, fraction=0.03, shrink=0.6, pad=0.04,
+                     label="|Shapley value| mean")
+    fig.suptitle(f"Shapley values per modality — mean ({resolution}°×{resolution}° grid)",
+                 fontsize=15, y=0.98)
     plt.tight_layout()
     p = out_dir / "shapley_map.png"
-    plt.savefig(p, dpi=600, bbox_inches="tight")
+    plt.savefig(p, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Combined map saved -> {p}", flush=True)
+    print(f"Combined mean map saved -> {p}", flush=True)
 
-    # ── Individual figures ────────────────────────────────────────────────────
+    # ── Combined std figure ───────────────────────────────────────────────────
+    std_grids = {}
     for view in view_names:
         values = df[f"{view}_shapley"].abs().values
-        vmax_v = values.max()
-        fig, ax = plt.subplots(figsize=(8, 5))
-        _setup_ax(ax, borders, f"Shapley — {view}", lon_min, lon_max, lat_min, lat_max)
-        sc = ax.scatter(lons[idx], lats[idx], c=values[idx],
-                        cmap="plasma", vmin=0, vmax=vmax_v,
-                        s=0.5, linewidths=0, rasterized=True)
-        plt.colorbar(sc, ax=ax, fraction=0.03, shrink=0.6, pad=0.04,
-                     label="|Shapley value|")
+        _, std, lc, ltc = _to_grid(values, resolution)
+        std_grids[view] = (std, lc, ltc)
+
+    vmax_std = max(np.nanpercentile(std_grids[v][0], 98)
+                   for v in view_names
+                   if not np.all(np.isnan(std_grids[v][0])))
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9),
+                             gridspec_kw={"hspace": 0.25, "wspace": 0.35})
+    axes = axes.flatten()
+    for ax, view in zip(axes, view_names):
+        std, lc, ltc = std_grids[view]
+        _setup_ax(ax, borders, view, lon_min, lon_max, lat_min, lat_max)
+        pc = ax.pcolormesh(lc, ltc, std.T, cmap="YlOrRd",
+                           vmin=0, vmax=vmax_std, shading="auto")
+        plt.colorbar(pc, ax=ax, fraction=0.03, shrink=0.6, pad=0.04,
+                     label="|Shapley value| std")
+    fig.suptitle(f"Shapley values per modality — std ({resolution}°×{resolution}° grid)",
+                 fontsize=15, y=0.98)
+    plt.tight_layout()
+    p = out_dir / "shapley_map_std.png"
+    plt.savefig(p, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Combined std map saved -> {p}", flush=True)
+
+    # ── Individual figures (mean + std) ──────────────────────────────────────
+    for view in view_names:
+        values = df[f"{view}_shapley"].abs().values
+        mean, std, lc, ltc = _to_grid(values, resolution)
+        vmax_v    = np.nanpercentile(values, 98)
+        vmax_std_v = np.nanpercentile(std[~np.isnan(std)], 98) \
+                     if not np.all(np.isnan(std)) else 1.0
+
+        fig, (ax_m, ax_s) = plt.subplots(1, 2, figsize=(14, 5),
+                                          gridspec_kw={"wspace": 0.3})
+        _setup_ax(ax_m, borders, f"Mean |φ| — {view}",
+                  lon_min, lon_max, lat_min, lat_max)
+        pc_m = ax_m.pcolormesh(lc, ltc, mean.T, cmap="plasma",
+                               vmin=0, vmax=vmax_v, shading="auto")
+        plt.colorbar(pc_m, ax=ax_m, fraction=0.03, shrink=0.6, pad=0.04,
+                     label="mean |φ|")
+
+        _setup_ax(ax_s, borders, f"Std |φ| — {view}",
+                  lon_min, lon_max, lat_min, lat_max)
+        pc_s = ax_s.pcolormesh(lc, ltc, std.T, cmap="YlOrRd",
+                               vmin=0, vmax=vmax_std_v, shading="auto")
+        plt.colorbar(pc_s, ax=ax_s, fraction=0.03, shrink=0.6, pad=0.04,
+                     label="std |φ|")
+
         plt.tight_layout()
         p = out_dir / f"shapley_map_{view}.png"
-        plt.savefig(p, dpi=600, bbox_inches="tight")
+        plt.savefig(p, dpi=300, bbox_inches="tight")
         plt.close()
         print(f"  -> {p}", flush=True)
 
@@ -1441,6 +1504,7 @@ def plot_tropical_comparison(
                 vals = _phi(df[df["climate_zone"] == zone][col].dropna()).values
                 if len(vals) < 10:
                     continue
+                if np.std(vals) == 0: continue
                 kde    = gaussian_kde(vals, bw_method="scott")
                 color  = ZONE_COLORS[zone]
                 n      = len(vals)
@@ -1778,6 +1842,8 @@ def plot_phi_vs_performance(
 
             if has_kde and len(vals_ok) > 5 and len(vals_err) > 5:
                 for vals, key in [(vals_ok, (cls, True)), (vals_err, (cls, False))]:
+                    if np.std(vals) == 0:
+                        continue
                     kde   = gaussian_kde(vals, bw_method="scott")
                     color = COLORS[key]
                     label = f"{LABELS[key]} (n={len(vals)})"
@@ -2053,6 +2119,7 @@ def plot_subpopulation_profiles(
             vals = df[df["subpop"] == sp][col].dropna().values
             if len(vals) < 10:
                 continue
+            if np.std(vals) == 0: continue
             kde = gaussian_kde(vals, bw_method="scott")
             ax.plot(x_grid, kde(x_grid),
                     color=subpop_colors[sp], linewidth=2,
@@ -2117,3 +2184,344 @@ def plot_subpop_k_selection(k_analysis: dict, out_dir):
     plt.savefig(p, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"  -> subpop_k_selection.png", flush=True)
+
+
+# ── φ par décision du modèle ──────────────────────────────────────────────────
+
+def plot_phi_by_predicted_class(
+    df: pd.DataFrame,
+    view_names: list,
+    out_dir,
+):
+    """
+    Compare mean signed φ between:
+        - All points (global)
+        - Points predicted crop   (pred_score > 0)
+        - Points predicted non-crop (pred_score <= 0)
+
+    Answers: "which modalities drive the crop/non-crop decision?"
+
+    Produces:
+        phi_by_predicted_class.png   — barplot mean φ × 3 groups
+        phi_kde_predicted_class.png  — KDE per modality × 3 groups
+        phi_by_predicted_class.csv
+    """
+    if "pred_score" not in df.columns:
+        print("WARNING: 'pred_score' column missing, skipped.", flush=True)
+        return
+
+    from scipy.stats import gaussian_kde
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    phi_cols = [f"{v}_shapley" for v in view_names]
+    n_views  = len(view_names)
+
+    mask_crop    = df["pred_score"].values > 0
+    mask_noncrop = ~mask_crop
+
+    groups = [
+        ("Global",         np.ones(len(df), dtype=bool), "#888888"),
+        ("Prédit crop",    mask_crop,                     "#2ca02c"),
+        ("Prédit non-crop",mask_noncrop,                  "#d62728"),
+    ]
+
+    # ── CSV summary ───────────────────────────────────────────────────────────
+    rows = []
+    for group_name, mask, _ in groups:
+        sub = df[mask]
+        row = {"group": group_name, "n": mask.sum()}
+        for view, col in zip(view_names, phi_cols):
+            row[f"mean_phi_{view}"] = sub[col].mean()
+            row[f"std_phi_{view}"]  = sub[col].std()
+        rows.append(row)
+    df_summary = pd.DataFrame(rows)
+    df_summary.to_csv(out_dir / "phi_by_predicted_class.csv", index=False)
+
+    # Print
+    sep = "-" * 64
+    print(f"\n{sep}\n  mean φ by predicted class\n{sep}")
+    for _, row in df_summary.iterrows():
+        vals = "  ".join(
+            f"{v}={row[f'mean_phi_{v}']:.3f}" for v in view_names)
+        print(f"  {row['group']:<20} (n={int(row['n']):>6})  {vals}")
+    print(sep)
+
+    # ── Barplot ───────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(max(6, n_views * 2), 5))
+    width   = 0.8 / len(groups)
+    x       = np.arange(n_views)
+
+    for gi, (group_name, mask, color) in enumerate(groups):
+        sub    = df[mask]
+        means  = [sub[c].mean() for c in phi_cols]
+        stds   = [sub[c].std()  for c in phi_cols]
+        offset = (gi - len(groups) / 2 + 0.5) * width
+        ax.bar(x + offset, means, width=width * 0.9,
+               color=color, label=f"{group_name} (n={mask.sum()})",
+               edgecolor="white", linewidth=0.4, zorder=2, alpha=0.85)
+        ax.errorbar(x + offset, means, yerr=stds,
+                    fmt="none", color="#333333", capsize=3,
+                    linewidth=0.8, zorder=3)
+
+    ax.axhline(0, color="#888888", linewidth=0.8, linestyle="--")
+    ax.set_xticks(x)
+    ax.set_xticklabels(view_names, fontsize=11)
+    ax.set_ylabel("mean φ", fontsize=11)
+    ax.set_title("Shapley contributions selon la décision du modèle\n"
+                 "(φ signé — baseline = 0.5)", fontsize=11)
+    ax.legend(fontsize=9, framealpha=0.85)
+    ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
+    ax.set_axisbelow(True)
+    plt.tight_layout()
+    plt.savefig(out_dir / "phi_by_predicted_class.png", dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  -> phi_by_predicted_class.png", flush=True)
+
+    # ── KDE par modalité ──────────────────────────────────────────────────────
+    fig, axes = plt.subplots(1, n_views,
+                             figsize=(max(8, n_views * 3), 4),
+                             sharey=False)
+    if n_views == 1:
+        axes = [axes]
+
+    for ax, view, col in zip(axes, view_names, phi_cols):
+        all_vals = df[col].dropna().values
+        x_grid   = np.linspace(np.percentile(all_vals, 1),
+                               np.percentile(all_vals, 99), 300)
+
+        for group_name, mask, color in groups:
+            vals = df[mask][col].dropna().values
+            if len(vals) < 10:
+                continue
+            if np.std(vals) == 0:
+                continue
+            kde   = gaussian_kde(vals, bw_method="scott")
+            lw    = 1.5 if group_name == "Global" else 2.0
+            ls    = "--" if group_name == "Global" else "-"
+            ax.plot(x_grid, kde(x_grid), color=color,
+                    linewidth=lw, linestyle=ls,
+                    label=f"{group_name} (n={mask.sum()})")
+            if group_name != "Global":
+                ax.fill_between(x_grid, kde(x_grid),
+                                alpha=0.1, color=color)
+
+        ax.axvline(0, color="#aaaaaa", linewidth=0.8, linestyle=":")
+        ax.set_xlabel("φ", fontsize=10)
+        ax.set_ylabel("Densité" if ax == axes[0] else "")
+        ax.set_title(view, fontsize=11)
+        ax.legend(fontsize=7, framealpha=0.85)
+        ax.grid(linestyle="--", alpha=0.3)
+
+    fig.suptitle("Distribution de φ selon la décision du modèle",
+                 fontsize=12, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(out_dir / "phi_kde_predicted_class.png",
+                dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  -> phi_kde_predicted_class.png", flush=True)
+    print(f"φ by predicted class saved -> {out_dir}", flush=True)
+
+
+# ── Shapley maps split by predicted class ─────────────────────────────────────
+
+def plot_shapley_maps_by_class(
+    df: pd.DataFrame,
+    view_names: list,
+    out_dir,
+    lon_min=-180, lon_max=180, lat_min=-90, lat_max=90,
+    resolution: float = 2.0,
+    class_names: dict = None,
+):
+    """
+    Generate Shapley maps (mean |φ|) split by predicted class.
+    One combined figure per class showing all modalities.
+
+    Args:
+        class_names: optional dict {class_id: label} e.g. {0: "Wheat", 1: "Maize"}
+    """
+    if "pred_class" not in df.columns:
+        print("WARNING: 'pred_class' column missing, skipping per-class maps.", flush=True)
+        return
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    borders = _get_world_borders()
+
+    lons = df["lon"].values
+    lats = df["lat"].values
+    classes = sorted(df["pred_class"].unique())
+    n_views = len(view_names)
+
+    def _to_grid(lons_, lats_, values, res):
+        lon_edges = np.arange(-180, 180 + res, res)
+        lat_edges = np.arange(-90,   90 + res, res)
+        n_lon = len(lon_edges) - 1
+        n_lat = len(lat_edges) - 1
+        lon_idx = np.clip(np.digitize(lons_, lon_edges) - 1, 0, n_lon - 1)
+        lat_idx = np.clip(np.digitize(lats_, lat_edges) - 1, 0, n_lat - 1)
+        flat    = lon_idx * n_lat + lat_idx
+        valid   = ~np.isnan(values)
+        gs = np.bincount(flat[valid], weights=values[valid],
+                         minlength=n_lon * n_lat).reshape(n_lon, n_lat)
+        gc = np.bincount(flat[valid], minlength=n_lon * n_lat).reshape(n_lon, n_lat)
+        grid = np.where(gc > 0, gs / gc, np.nan)
+        lc  = (lon_edges[:-1] + lon_edges[1:]) / 2
+        ltc = (lat_edges[:-1] + lat_edges[1:]) / 2
+        return grid, lc, ltc
+
+    # Shared vmax across all classes for comparability
+    vmax = max(
+        np.nanpercentile(df[f"{v}_shapley"].abs().values, 98)
+        for v in view_names
+    )
+
+    for cls in classes:
+        mask = df["pred_class"].values == cls
+        df_cls = df[mask]
+        n_cls  = mask.sum()
+        label  = class_names.get(cls, f"Class {cls}") if class_names else f"Class {cls}"
+        print(f"  Class {cls} ({label}): {n_cls} points", flush=True)
+
+        ncols = min(n_views, 4)
+        nrows = math.ceil(n_views / ncols)
+        fig, axes = plt.subplots(nrows, ncols,
+                                 figsize=(6 * ncols, 4 * nrows),
+                                 gridspec_kw={"hspace": 0.3, "wspace": 0.3})
+        axes = np.array(axes).flatten()
+
+        for ax_idx, view in enumerate(view_names):
+            values = df_cls[f"{view}_shapley"].abs().values
+            lons_cls = df_cls["lon"].values
+            lats_cls = df_cls["lat"].values
+            grid, lc, ltc = _to_grid(lons_cls, lats_cls, values, resolution)
+            _setup_ax(axes[ax_idx], borders, view,
+                      lon_min, lon_max, lat_min, lat_max)
+            pc = axes[ax_idx].pcolormesh(lc, ltc, grid.T,
+                                         cmap="plasma", vmin=0, vmax=vmax,
+                                         shading="auto")
+            plt.colorbar(pc, ax=axes[ax_idx], fraction=0.03,
+                         shrink=0.6, pad=0.04, label="|φ|")
+
+        for ax in axes[n_views:]:
+            ax.set_visible(False)
+
+        fig.suptitle(f"Shapley values — {label}  (n={n_cls}, {resolution}°×{resolution}° grid)",
+                     fontsize=13, y=1.01)
+        plt.tight_layout()
+        p = out_dir / f"shapley_map_class{cls}.png"
+        plt.savefig(p, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"  -> {p.name}", flush=True)
+
+    print(f"Per-class Shapley maps saved -> {out_dir}", flush=True)
+
+
+# ── KDE de φ signé par classe prédite ────────────────────────────────────────
+
+def plot_shapley_kde_by_class(
+    df: pd.DataFrame,
+    view_names: list,
+    out_dir,
+    class_names: dict = None,
+):
+    """
+    Pour chaque modalité, une figure avec une courbe KDE de φ signé par classe prédite.
+    Permet de voir si le modèle utilise différemment les modalités selon la classe.
+    """
+    from scipy.stats import gaussian_kde
+
+    if "pred_class" not in df.columns:
+        print("WARNING: 'pred_class' column missing, KDE by class skipped.", flush=True)
+        return
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    classes = sorted(df["pred_class"].unique())
+    n_classes = len(classes)
+
+    PALETTE = ["#4e79a7","#f28e2b","#e15759","#76b7b2",
+               "#59a14f","#edc948","#b07aa1","#9c755f",
+               "#bab0ac","#d37295"]
+
+    for view in view_names:
+        col = f"{view}_shapley"
+        if col not in df.columns:
+            continue
+
+        all_vals = df[col].dropna().values
+        x_min = np.percentile(all_vals, 1)
+        x_max = np.percentile(all_vals, 99)
+        x_grid = np.linspace(x_min, x_max, 400)
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        for cls in classes:
+            mask = df["pred_class"].values == cls
+            vals = df[mask][col].dropna().values
+            if len(vals) < 10 or np.std(vals) == 0:
+                continue
+            label = class_names.get(cls, f"Class {cls}") if class_names else f"Class {cls}"
+            color = PALETTE[cls % len(PALETTE)]
+            kde = gaussian_kde(vals, bw_method="scott")
+            ax.plot(x_grid, kde(x_grid), color=color, linewidth=2,
+                    label=f"{label} (n={mask.sum()})")
+            ax.fill_between(x_grid, kde(x_grid), alpha=0.08, color=color)
+
+        ax.axvline(0, color="#888888", linewidth=0.9, linestyle="--", label="φ = 0")
+        ax.set_xlabel("φ (signé)", fontsize=11)
+        ax.set_ylabel("Densité", fontsize=11)
+        ax.set_title(f"Distribution de φ par classe prédite — {view}", fontsize=12)
+        ax.legend(fontsize=8, framealpha=0.85,
+                  ncol=max(1, n_classes // 6),
+                  loc="upper right")
+        ax.grid(linestyle="--", alpha=0.3)
+        plt.tight_layout()
+        p = out_dir / f"kde_by_class_{view}.png"
+        plt.savefig(p, dpi=200, bbox_inches="tight")
+        plt.close()
+        print(f"  -> {p.name}", flush=True)
+
+    # Figure combinée — toutes les modalités, une ligne par classe
+    n_views = len(view_names)
+    fig, axes = plt.subplots(n_classes, n_views,
+                             figsize=(3.5 * n_views, 2.5 * n_classes),
+                             sharex="col", sharey=False)
+    if n_classes == 1:
+        axes = axes[np.newaxis, :]
+    if n_views == 1:
+        axes = axes[:, np.newaxis]
+
+    for ri, cls in enumerate(classes):
+        mask  = df["pred_class"].values == cls
+        label = class_names.get(cls, f"Class {cls}") if class_names else f"Class {cls}"
+        color = PALETTE[cls % len(PALETTE)]
+        for ci, view in enumerate(view_names):
+            ax  = axes[ri, ci]
+            col = f"{view}_shapley"
+            vals = df[mask][col].dropna().values
+            if len(vals) >= 10 and np.std(vals) > 0:
+                all_v  = df[col].dropna().values
+                x_grid = np.linspace(np.percentile(all_v, 1),
+                                     np.percentile(all_v, 99), 300)
+                kde = gaussian_kde(vals, bw_method="scott")
+                ax.plot(x_grid, kde(x_grid), color=color, linewidth=1.5)
+                ax.fill_between(x_grid, kde(x_grid), alpha=0.2, color=color)
+            ax.axvline(0, color="#888888", linewidth=0.7, linestyle="--")
+            ax.set_yticks([])
+            ax.grid(linestyle="--", alpha=0.2)
+            if ri == 0:
+                ax.set_title(view, fontsize=9, fontweight="bold")
+            if ci == 0:
+                ax.set_ylabel(label, fontsize=8, rotation=0,
+                              labelpad=60, va="center")
+
+    fig.suptitle("φ signé par classe prédite × modalité", fontsize=12, y=1.01)
+    plt.tight_layout()
+    p = out_dir / "kde_by_class_combined.png"
+    plt.savefig(p, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  -> kde_by_class_combined.png", flush=True)
+    print(f"KDE by class saved -> {out_dir}", flush=True)

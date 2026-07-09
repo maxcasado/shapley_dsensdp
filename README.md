@@ -4,33 +4,50 @@ Fork of [fmenat/DSensDp](https://github.com/fmenat/DSensDp). This version adds S
 
 ---
 
-## Project structure
+## Architecture — one source, everything derived
+
+The v-dicts are the **single source of truth**: the only artefact that needs model
+inference. Everything else (tables, figures) is pure post-processing over them, with
+the cross-fold **significance layer** (mean ± std, `|SNR|>2` gate, paired Wilcoxon)
+baked in so nothing is ever reported as a bare mean. Because the v-dicts store the
+per-coalition predictions (format v2), the **characteristic function** (`f1_weighted`,
+`mcc`, `balanced_accuracy`, …) is a post-processing flag — no re-inference to change it.
+
+```
+scripts/vdict/build_vdicts.py  ──►  results/<model>/vdict/v_dict_fold{0..4}.pkl   [SOURCE]
+                                                │
+                                     scripts/attribution/build_all.py              [1 driver]
+                                                ▼
+                          results/attribution/**  +  results/figures/**  +  paper/tables/**
+```
+
+### Repository layout
 
 ```
 DSensDp/
-├── train_multi.py      # Train a multi-sensor fusion model (DSensDp)
-├── train_single.py     # Train a single-input fusion model
-├── eval.py             # Evaluate a saved checkpoint on its test set
-├── explain.py          # Per-point spatial Shapley maps over a bounding box
-├── evaluate.py         # Aggregate metrics across runs/methods (inherited)
+├── scripts/                    # thin CLIs, grouped by function — run as `python -m scripts.<group>.<name>`
+│   ├── train/                  #   train_single · train_multi · train_geo_transfer
+│   ├── vdict/                  #   build_vdicts (SOURCE OF TRUTH) · subset_metrics
+│   ├── attribution/            #   build_all (tables+figs, significance) · perceptual_score
+│   ├── spatial/                #   explain · spatial_stats · point_spatial_stats · compare_stats · compare_maps
+│   ├── noise/                  #   run_ablation · aggregate · plot · injection
+│   ├── representation/         #   branch_cka  (CKA, invariant to the Shapley fix)
+│   ├── legacy/                 #   evaluate · script_koppen_shapley · script_shapley_viz · run_comparison_analysis
+│   └── build_paper.py          #   orchestrator: `--plan` prints the full ordered pipeline
 │
-├── config/             # YAML experiment configs
-├── data/               # Dataset preparation scripts
-├── code/               # Inherited model and training code (do not modify)
+├── shap_analysis/              # post-processing library (the heavy logic)
+│   ├── shapley.py              #   cooperative-game formula · run_subset_inference (v2) · scalar_vdict (v1/v2 reader)
+│   ├── characteristic.py       #   CHAR_FUNCS registry (metric = flag) · analytical baselines v(∅)
+│   ├── stats.py                #   significance: SNR_THRESHOLD, agg, agg_frame, fmt, wilcoxon_paired
+│   ├── comparison.py           #   per-fold Shapley tables · redundancy · correlation
+│   ├── tables.py               #   attribution / coalition-value / geo-comparison builders
+│   ├── figures.py              #   figures with cross-fold error bars (shared palette)
+│   └── spatial_shapley.py      #   per-point Shapley + SII (characteristic = raw logit)
 │
-├── utils/
-│   ├── metrics.py      # compute_metrics, get_random_baseline_metrics
-│   ├── checkpoint.py   # build_model, load_test_data, resolve_weights_path
-│   ├── geo.py          # build_coords, assign_continents
-│   └── debug.py        # inspect_data_structure
-│
-├── shap_analysis/
-│   ├── shapley.py          # Aggregate Shapley (metric-based, used in train loop)
-│   └── spatial_shapley.py  # Per-point Shapley + Shapley Interaction Index (SII)
-│
-└── visualize/
-    ├── maps.py              # Spatial maps: Shapley, GT/pred, interactions
-    └── plot_shapley_stats.py # Histograms and stats from explain.py CSV output
+├── paper/tables/               # LaTeX/CSV formatters, read results/attribution/**
+├── config/  data/  code/       # configs · data prep · inherited model code (do not modify)
+├── utils/                      # metrics · checkpoint · geo · debug
+└── visualize/                  # maps · plot_shapley_stats
 ```
 
 ---
@@ -79,14 +96,17 @@ training:
 
 ## Usage
 
+> Run everything from the repo root as a module (`python -m scripts.<group>.<name>`),
+> so the `code.` / `shap_analysis.` / `utils.` imports resolve.
+
 ### Training
 
 ```bash
 # Multi-sensor fusion (DSensDp)
-python train_multi.py -s config/dsensdp_ex.yaml
+python -m scripts.train.train_multi -s config/dsensdp_ex.yaml
 
 # Single-input fusion
-python train_single.py -s config/dsensdp_ex.yaml
+python -m scripts.train.train_single -s config/dsensdp_ex.yaml
 ```
 
 At each fold, saves:
@@ -97,24 +117,29 @@ At each fold, saves:
 
 ---
 
-### Evaluation
-
-Loads a checkpoint and evaluates it on its saved test set.
+### Build the v-dicts (source of truth) & the attribution deliverables
 
 ```bash
-# Metrics only
-python eval.py -s config/dsensdp_ex.yaml -r 0 -f 0
+# 1) Regenerate the v-dicts (format v2, predictions stored) — needs checkpoints + GPU
+python -m scripts.vdict.build_vdicts -s config/com_average.yaml \
+    --fold_ids 0 1 2 3 4 --shapley --out_dir results/com/vdict
+python -m scripts.vdict.build_vdicts -s config/com_geo.yaml \
+    --fold_ids 0 1 2 3 4 --shapley --fixed_views geo --out_dir results/com_geo/vdict
 
-# With aggregate Shapley values (one value per view per metric)
-python eval.py -s config/dsensdp_ex.yaml -r 0 -f 0 --shapley
+# 2) Everything else — tables (mean ± std + SNR gate), figures, LaTeX — no GPU
+python -m scripts.attribution.build_all --paper
+#   --metric mcc | balanced_accuracy    # swap the characteristic function (needs v2 v-dicts)
 
-# With explicit checkpoint path
-python eval.py -s config/dsensdp_ex.yaml -w res_out/weights/Dec_avg-SD-ignore-Plus/model_run0_fold0.pt
+# Full ordered pipeline (incl. the GPU steps: noise ablation, spatial maps):
+python -m scripts.build_paper --plan
 ```
 
-Outputs:
-- `preds/metrics_run{r}_fold{f}.csv`
-- `preds/shapley_run{r}_fold{f}.csv` (if `--shapley`)
+`build_all` also works on the legacy v1 v-dicts (`results/<model>/eval*/`) — it just
+can't swap the metric there. Plain per-fold metrics/Shapley for one checkpoint:
+
+```bash
+python -m scripts.vdict.build_vdicts -s config/dsensdp_ex.yaml -r 0 -f 0 --shapley
+```
 
 ---
 
@@ -124,18 +149,18 @@ Computes per-point Shapley values within a geographic bounding box and generates
 
 ```bash
 # Single fold
-python explain.py -s config/dsensdp_ex.yaml -f 0
+python -m scripts.spatial.explain -s config/dsensdp_ex.yaml -f 0
 
 # All folds combined (recommended — each point evaluated by the model that didn't train on it)
-python explain.py -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4
+python -m scripts.spatial.explain -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4
 
 # Restrict to a region (France)
-python explain.py -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4 \
+python -m scripts.spatial.explain -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4 \
     --lon_min -5.5 --lon_max 9.5 --lat_min 41.0 --lat_max 51.5 \
     --out_dir preds/france
 
 # Export as GeoJSON
-python explain.py -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4 --geo_format geojson
+python -m scripts.spatial.explain -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4 --geo_format geojson
 ```
 
 Output directory structure (`preds/spatial/` by default):
@@ -169,7 +194,7 @@ python visualize/plot_shapley_stats.py \
 Reads saved predictions from `res_out/pred/` and computes metrics across all runs and methods.
 
 ```bash
-python evaluate.py -s config/eval_ex.yaml
+python -m scripts.legacy.evaluate -s config/eval_ex.yaml
 ```
 
 ---

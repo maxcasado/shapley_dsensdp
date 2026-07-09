@@ -44,7 +44,7 @@ def main_run(config_file, just_return_first_model=False):
     print(f"METHOD_NAME = '{method_name}'")
 
     if "train" in data_name:
-        data_views_tr = load_structure(input_dir_folder, data_name, load_memory=config_file.get("load_memory", False))
+        data_views_tr = load_structure(input_dir_folder, data_name, load_memory=config_file.get("load_memory", False), views_used=config_file.get("experiment", {}).get("preprocess", {}).get("view_names", []))
         data_views_tr.load_stats(input_dir_folder, data_name)
         data_views_te = load_structure(input_dir_folder, data_name.replace("train", "test"), load_memory=config_file.get("load_memory", False))
         data_views_te.load_stats(input_dir_folder, data_name)
@@ -56,7 +56,7 @@ def main_run(config_file, just_return_first_model=False):
             print("No validation set found, using test set as validation.")
         kfolds = 1
     else:
-        data_views_tr = load_structure(input_dir_folder, data_name, load_memory=config_file.get("load_memory", False))
+        data_views_tr = load_structure(input_dir_folder, data_name, load_memory=config_file.get("load_memory", False), views_used=config_file.get("experiment", {}).get("preprocess", {}).get("view_names", []))
         data_views_tr.load_stats(input_dir_folder, data_name)
         kfolds = config_file["experiment"].get("kfolds", 2)
 

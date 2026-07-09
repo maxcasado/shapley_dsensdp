@@ -6,3 +6,8 @@ __pycache__/
 *.pt
 *.npy
 CoM-views/
+legacy/
+logs/
+paper/
+results/
+scraps/

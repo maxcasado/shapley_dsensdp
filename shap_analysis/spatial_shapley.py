@@ -58,48 +58,52 @@ def compute_spatial_shapley(
     task_type: str,
     view_names: list,
     baseline: float = None,
+    fixed_views: list = [],
 ) -> tuple:
     """
     Compute per-point Shapley values for samples in bbox_idx.
 
-    The characteristic function v(S, x) is the model logit at point x when
-    only the views in S are observed. For multiclass tasks, the logit of the
-    class predicted by the full model is used as reference.
-
     Args:
-        method:     Trained model (eval mode, missing_info already set).
-        data_te:    Full test Dataset_MultiView.
-        bbox_idx:   Indices of the samples to explain (bounding box filter).
-        batch_size: Inference batch size.
-        task_type:  "classification" | "multilabel".
-        view_names: Full list of sensor/modality names.
-        baseline:   Value for v(∅, x) applied to all points.
-                    If None, uses the proportion of positive labels in data_te
-                    (task-specific crop baseline). Pass 0.0 for a neutral baseline.
-
-    Returns:
-        (shapley_matrix, full_preds, v_dict)
-        - shapley_matrix : np.ndarray (n_bbox, n_views)
-        - full_preds     : np.ndarray (n_bbox,) — logits with all views
-        - v_dict         : {frozenset → np.ndarray (n_bbox,)} for all coalitions
+        fixed_views: Views always present in every coalition — they are not
+                     explained (no φ computed for them) but always passed to
+                     the model. Useful for geo-coordinates that are always
+                     available in practice.
     """
     n_views = len(view_names)
     n_bbox  = len(bbox_idx)
 
+    # Split free vs fixed views
+    free_views = [v for v in view_names if v not in fixed_views]
+    fixed_set  = [v for v in view_names if v in fixed_views]
+    n_free     = len(free_views)
+
+    if fixed_set:
+        print(f"  Fixed views (always in coalition): {fixed_set}", flush=True)
+        print(f"  Free views (explained): {free_views}", flush=True)
+
     # ── Baseline v(∅) ─────────────────────────────────────────────────────────
     if baseline is None:
-        labels  = data_te.get_all_labels()
+        labels   = data_te.get_all_labels()
         baseline = float(np.mean(labels == 1))
-        print(f"  Baseline v(∅) = {baseline:.4f} (positive class proportion)", flush=True)
+        print(f"  Baseline v(∅) = {baseline:.4f} (positive class proportion)",
+              flush=True)
+    baseline_arr = np.full(n_bbox, baseline, dtype=np.float64)
 
-    v_dict    = {frozenset(): np.full(n_bbox, baseline, dtype=np.float64)}
-    ref_class = None  # fixed on the full-view pass (multiclass)
+    v_dict    = {frozenset(): baseline_arr}
+    ref_class = None
 
-    # ── All subsets, size 1 → N ───────────────────────────────────────────────
-    all_subsets   = [list(c) for s in range(1, n_views + 1)
-                     for c in itertools.combinations(view_names, s)]
+    # Map fixed-only coalition to the baseline
+    if fixed_set:
+        v_dict[frozenset(fixed_set)] = baseline_arr
+
+    # ── All subsets over FREE views only, fixed views always added ────────────
+    all_subsets = [list(c) + fixed_set
+                   for s in range(1, n_free + 1)
+                   for c in itertools.combinations(free_views, s)]
+
     n_subsets = len(all_subsets)
-    print(f"  Running {n_subsets} inference passes (2^{n_views}-1 subsets)...", flush=True)
+    print(f"  Running {n_subsets} inference passes "
+          f"(2^{n_free}-1 free subsets, fixed={fixed_set or 'none'})...", flush=True)
 
     for i, subset_list in enumerate(all_subsets):
         label       = "+".join(subset_list)
@@ -109,10 +113,12 @@ def compute_spatial_shapley(
         if logits_bbox.ndim > 1:
             n_classes = logits_bbox.shape[1]
             if n_classes == 2:
-                # Binary classification: always use class 1 (positive/crop)
-                # so that v(S, x) = P(crop | S) and pred_score is directly
-                # comparable to a 0.5 threshold.
-                logits_bbox = logits_bbox[:, 1]
+                # Binary classification: apply softmax then extract P(crop=1)
+                # so that v(S, x) ∈ [0,1] and pred_score >= 0.5 matches
+                # the model's decision boundary directly.
+                e = np.exp(logits_bbox - logits_bbox.max(axis=1, keepdims=True))
+                probs = e / e.sum(axis=1, keepdims=True)
+                logits_bbox = probs[:, 1]  # P(crop)
             else:
                 # Multiclass: project onto the class predicted by the full model
                 fs = frozenset(subset_list)
@@ -126,19 +132,21 @@ def compute_spatial_shapley(
         v_dict[frozenset(subset_list)] = logits_bbox.astype(np.float64)
         print(f"    [{i+1}/{n_subsets}] {label}", flush=True)
 
-    # ── Per-point Shapley values ──────────────────────────────────────────────
+    # ── Per-point Shapley values (free views only) ────────────────────────────
     print("  Computing per-point Shapley values...", flush=True)
     shapley_matrix = np.zeros((n_bbox, n_views), dtype=np.float64)
 
     for j, view in enumerate(view_names):
-        others = [v for v in view_names if v != view]
+        if view in fixed_set:
+            continue  # no Shapley value for fixed views
+        others = [v for v in free_views if v != view]
         phi    = np.zeros(n_bbox, dtype=np.float64)
         for size in range(len(others) + 1):
             for S_tuple in itertools.combinations(others, size):
-                S      = frozenset(S_tuple)
-                s      = len(S)
-                weight = (math.factorial(s) * math.factorial(n_views - s - 1)
-                          / math.factorial(n_views))
+                S      = frozenset(S_tuple) | frozenset(fixed_set)
+                s      = len(frozenset(S_tuple))   # size without fixed
+                weight = (math.factorial(s) * math.factorial(n_free - s - 1)
+                          / math.factorial(n_free))
                 phi   += weight * (v_dict[S | {view}] - v_dict[S])
         shapley_matrix[:, j] = phi
 
@@ -152,46 +160,45 @@ def compute_shapley_interactions(
     v_dict: dict,
     view_names: list,
     n_bbox: int,
+    fixed_views: list = [],
 ) -> np.ndarray:
     """
-    Compute the Shapley Interaction Index (SII) order 2 for all view pairs.
-
-    SII(i,j) = Σ_{S ⊆ N\{i,j}} w(|S|) · Δ_{ij}(S)
-    Δ_{ij}(S) = v(S∪{i,j}) - v(S∪{i}) - v(S∪{j}) + v(S)
-    w(s)      = s! · (n-s-2)! / (n-1)!
-
-    Reuses the v_dict already built by compute_spatial_shapley.
-
-    Args:
-        v_dict:     {frozenset → np.ndarray (n_bbox,)} from compute_spatial_shapley.
-        view_names: Full list of view names.
-        n_bbox:     Number of points (bbox size).
-
-    Returns:
-        interaction_matrix: np.ndarray (n_bbox, n_views, n_views), symmetric.
+    Compute SII order-2 for all view pairs. Fixed views are always included
+    in every coalition and skipped in the interaction computation.
     """
     n_views = len(view_names)
     interaction_matrix = np.zeros((n_bbox, n_views, n_views), dtype=np.float64)
+
+    # Only keep fixed views that are actually present in v_dict keys
+    all_in_keys = set().union(*v_dict.keys()) if v_dict else set()
+    fixed_set   = frozenset(v for v in fixed_views if v in all_in_keys)
+    free_views  = [v for v in view_names
+                   if v not in fixed_views and v in all_in_keys]
+    n_free = len(free_views)
 
     for i, vi in enumerate(view_names):
         for j, vj in enumerate(view_names):
             if j <= i:
                 continue
-            others = [v for v in view_names if v not in (vi, vj)]
+            if vi in fixed_views or vj in fixed_views:
+                continue
+            if vi not in free_views or vj not in free_views:
+                continue  # skip views absent from v_dict
+            others = [v for v in free_views if v not in (vi, vj)]
             phi_ij = np.zeros(n_bbox, dtype=np.float64)
             for size in range(len(others) + 1):
                 for S_tuple in itertools.combinations(others, size):
-                    S      = frozenset(S_tuple)
-                    s      = len(S)
-                    weight = (math.factorial(s) * math.factorial(n_views - s - 2)
-                              / math.factorial(n_views - 1))
+                    S      = frozenset(S_tuple) | fixed_set
+                    s      = len(frozenset(S_tuple))
+                    weight = (math.factorial(s) * math.factorial(n_free - s - 2)
+                              / math.factorial(n_free - 1))
                     delta  = (v_dict[S | {vi, vj}]
                               - v_dict[S | {vi}]
                               - v_dict[S | {vj}]
                               + v_dict[S])
                     phi_ij += weight * delta
             interaction_matrix[:, i, j] = phi_ij
-            interaction_matrix[:, j, i] = phi_ij   # symmetric
+            interaction_matrix[:, j, i] = phi_ij
 
     print("  SII computed for all pairs.", flush=True)
     return interaction_matrix

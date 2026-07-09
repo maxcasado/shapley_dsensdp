@@ -6,13 +6,13 @@ Shapley values for each modality and generate spatial maps and grouped statistic
 
 Usage:
     # Single fold
-    python explain.py -s config/dsensdp_ex.yaml -r 0 -f 0
+    python -m scripts.spatial.explain -s config/dsensdp_ex.yaml -r 0 -f 0
 
     # All folds (full k-fold coverage — recommended)
-    python explain.py -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4
+    python -m scripts.spatial.explain -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4
 
     # Geographic subset
-    python explain.py -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4 \
+    python -m scripts.spatial.explain -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4 \
         --lon_min -5.5 --lon_max 9.5 --lat_min 41.0 --lat_max 51.5
 """
 
@@ -160,13 +160,20 @@ def _run_fold(
     method.set_missing_info(None, **ckpt_config["training"].get("missing_method", {}))
 
     t0 = time.time()
+    n_classes = len(np.unique(data_te.get_all_labels()))
+    baseline  = 1.0 / n_classes  # uniform prior over classes
     shapley_matrix, full_preds, v_dict = compute_spatial_shapley(
         method, data_te, bbox_idx, batch_size, task_type, view_names,
+        fixed_views=args.fixed_views,
+        baseline=baseline,
     )
     log(f"  Shapley done in {time.time() - t0:.1f}s")
 
     # ── Interaction index ─────────────────────────────────────────────────────
-    interaction_matrix = compute_shapley_interactions(v_dict, view_names, n_bbox)
+    # Debug: print v_dict keys
+    log(f"  v_dict keys ({len(v_dict)}): {sorted([str(sorted(k)) for k in list(v_dict.keys())[:8]])}")
+    interaction_matrix = compute_shapley_interactions(
+        v_dict, view_names, n_bbox, fixed_views=args.fixed_views)
 
     # ── Build DataFrame ───────────────────────────────────────────────────────
     ids_bbox = data_te.get_all_identifiers()[bbox_idx]
@@ -179,6 +186,24 @@ def _run_fold(
         "lat":        lats[bbox_idx],
         "pred_score": full_preds,
     }
+
+    # Store predicted class for multiclass models
+    # full_preds is P(argmax class) → need argmax over all classes
+    full_logits = v_dict.get(frozenset(view_names))
+    if full_logits is not None:
+        from code.datasets.utils import create_dataloader
+        with torch.no_grad():
+            out_full = method.transform(
+                create_dataloader(data_te, batch_size=batch_size, train=False),
+                out_norm="softmax", not_return_repre=True,
+            )
+        probs_full = out_full["prediction"][bbox_idx]
+        if probs_full.ndim > 1 and probs_full.shape[1] > 2:
+            df_dict["pred_class"] = probs_full.argmax(axis=1)
+        elif probs_full.ndim > 1 and probs_full.shape[1] == 2:
+            df_dict["pred_class"] = (probs_full[:, 1] > 0.5).astype(int)
+        else:
+            df_dict["pred_class"] = (probs_full > 0.5).astype(int)
     for j, view in enumerate(view_names):
         df_dict[f"{view}_shapley"] = shapley_matrix[:, j]
     for i, vi in enumerate(view_names):
@@ -246,9 +271,15 @@ def main(args):
     df["climate_zone"] = assign_climate_zones(df["lat"].values)
 
     if "label" in df.columns and "pred_score" in df.columns:
-        # pred_score is a log-odds (1D model output), decision boundary at 0
-        pred_class    = (df["pred_score"].values > 0).astype(int)
-        df["correct"] = pred_class == df["label"].values.astype(int)
+        # For multiclass, pred_score is stored as the class index predicted
+        # (argmax). Compare directly with label.
+        if "pred_class" in df.columns:
+            df["correct"] = df["pred_class"].values == df["label"].values.astype(int)
+        else:
+            # Binary fallback: pred_score > 0.5 (probability) or > 0 (log-odds)
+            threshold = 0.5 if df["pred_score"].max() <= 1.0 else 0.0
+            pred_class = (df["pred_score"].values > threshold).astype(int)
+            df["correct"] = pred_class == df["label"].values.astype(int)
 
     # ── Save CSV ──────────────────────────────────────────────────────────────
     out_root = Path(args.out_dir)
@@ -277,8 +308,19 @@ def main(args):
     dir_gt_pred  = out_root / "maps_gt_pred"
     dir_shapley  = out_root / "maps_shapley"
     dir_interact = out_root / "maps_interactions"
-    bbox_kw      = dict(lon_min=args.lon_min, lon_max=args.lon_max,
-                        lat_min=args.lat_min, lat_max=args.lat_max)
+
+    if args.auto_zoom:
+        pad = 5.0
+        bbox_kw = dict(
+            lon_min=float(df["lon"].min()) - pad,
+            lon_max=float(df["lon"].max()) + pad,
+            lat_min=float(df["lat"].min()) - pad,
+            lat_max=float(df["lat"].max()) + pad,
+        )
+        log(f"Auto-zoom: {bbox_kw}")
+    else:
+        bbox_kw = dict(lon_min=args.lon_min, lon_max=args.lon_max,
+                       lat_min=args.lat_min, lat_max=args.lat_max)
 
     # ── Plots ─────────────────────────────────────────────────────────────────
     log("\nComputing grouped statistics...")
@@ -325,10 +367,113 @@ def main(args):
         plot_subpopulation_profiles(df, view_names, out_dir=dir_subpop)
 
     log("\nGenerating GT / prediction maps...")
-    plot_gt_pred_maps(df, out_dir=dir_gt_pred, **bbox_kw)
+    n_classes = int(df["label"].nunique()) if "label" in df.columns else 2
+    if n_classes <= 2:
+        plot_gt_pred_maps(df, out_dir=dir_gt_pred, **bbox_kw)
+    else:
+        log(f"  Skipping binary GT/pred maps (multiclass with {n_classes} classes).")
 
     log("\nGenerating Shapley maps...")
     plot_shapley_maps(df, view_names, out_dir=dir_shapley, **bbox_kw)
+
+    # Regional maps — zoom on data-dense areas
+    if args.auto_zoom:
+        from sklearn.cluster import KMeans
+        import matplotlib.patches as mpatches
+        coords_arr = df[["lon", "lat"]].values
+        n_regions  = min(6, len(df) // 200)
+        if n_regions >= 2:
+            log(f"\nGenerating {n_regions} regional Shapley maps...")
+            km = KMeans(n_clusters=n_regions, random_state=0, n_init=10)
+            km.fit(coords_arr)
+
+            # ── World overview with cluster bounding boxes ────────────────
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
+            try:
+                from visualize.maps import _get_world_borders, _draw_borders
+                borders = _get_world_borders()
+            except Exception:
+                borders = None
+
+            PALETTE = ["#e15759","#4e79a7","#f28e2b","#76b7b2",
+                       "#59a14f","#edc948"]
+            pad = 3.0
+
+            fig, ax = plt.subplots(figsize=(14, 7))
+            ax.set_xlim(-180, 180); ax.set_ylim(-90, 90)
+            ax.set_aspect("equal")
+            ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+            ax.set_title("Data clusters — regional Shapley analysis", fontsize=13)
+
+            if borders is not None:
+                try:
+                    from visualize.maps import _draw_borders
+                    _draw_borders(ax, borders, -180, 180, -90, 90)
+                except Exception:
+                    pass
+
+            legend_patches = []
+            region_boxes   = []
+
+            for reg_id in range(n_regions):
+                mask   = km.labels_ == reg_id
+                df_reg = df[mask]
+                color  = PALETTE[reg_id % len(PALETTE)]
+
+                # Scatter points
+                ax.scatter(df_reg["lon"].values, df_reg["lat"].values,
+                           c=color, s=1.5, linewidths=0,
+                           rasterized=True, alpha=0.6, zorder=2)
+
+                # Bounding box
+                x0 = float(df_reg["lon"].min()) - pad
+                x1 = float(df_reg["lon"].max()) + pad
+                y0 = float(df_reg["lat"].min()) - pad
+                y1 = float(df_reg["lat"].max()) + pad
+                rect = plt.Rectangle((x0, y0), x1-x0, y1-y0,
+                                     linewidth=2, edgecolor=color,
+                                     facecolor="none", zorder=3)
+                ax.add_patch(rect)
+                ax.text(x0 + (x1-x0)/2, y1 + 1.5, f"R{reg_id}",
+                        ha="center", va="bottom", fontsize=10,
+                        color=color, fontweight="bold")
+
+                legend_patches.append(
+                    mpatches.Patch(color=color,
+                                   label=f"R{reg_id} (n={mask.sum()})"))
+                region_boxes.append((reg_id, x0, x1, y0, y1))
+
+            ax.legend(handles=legend_patches, loc="lower left",
+                      fontsize=9, framealpha=0.85, title="Regions")
+            ax.grid(linestyle="--", alpha=0.3, zorder=0)
+            plt.tight_layout()
+            p = dir_shapley / "regions_overview.png"
+            plt.savefig(p, dpi=300, bbox_inches="tight")
+            plt.close()
+            log(f"  -> regions_overview.png")
+
+            # ── Per-region zoomed maps ────────────────────────────────────
+            for reg_id, x0, x1, y0, y1 in region_boxes:
+                mask   = km.labels_ == reg_id
+                df_reg = df[mask]
+                reg_kw = dict(lon_min=x0, lon_max=x1,
+                              lat_min=y0, lat_max=y1)
+                plot_shapley_maps(df_reg, view_names,
+                                  out_dir=dir_shapley / f"region_{reg_id}",
+                                  resolution=0.2,
+                                  **reg_kw)
+                log(f"  -> region_{reg_id} ({mask.sum()} points)")
+
+    if "pred_class" in df.columns and df["pred_class"].nunique() > 2:
+        log("\nGenerating per-class Shapley maps...")
+        from visualize.maps import plot_shapley_maps_by_class, plot_shapley_kde_by_class
+        plot_shapley_maps_by_class(df, view_names,
+                                   out_dir=dir_shapley / "by_class",
+                                   **bbox_kw)
+        log("\nGenerating signed φ KDE by class...")
+        plot_shapley_kde_by_class(df, view_names,
+                                  out_dir=dir_shapley / "by_class")
 
     log("\nGenerating interaction plots...")
     plot_interaction_graph(shapley_matrix, interaction_matrix, view_names, out_dir=dir_interact)
@@ -404,6 +549,11 @@ def parse_args():
                    help="Run subpopulation discovery (GMM on signed φ profiles).")
     p.add_argument("--n_subpop", type=int, default=None,
                    help="Number of subpopulations. If not set, selected by BIC.")
+    p.add_argument("--fixed_views", nargs="*", default=[],
+                   help="Views always included in every coalition (not explained). "
+                        "e.g. --fixed_views geo")
+    p.add_argument("--auto_zoom", action="store_true",
+                   help="Auto-zoom maps to data extent instead of full world view.")
 
     args = p.parse_args()
 

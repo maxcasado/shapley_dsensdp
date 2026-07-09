@@ -4,7 +4,8 @@ utils/checkpoint.py
 Shared utilities for loading a saved checkpoint and reconstructing
 the model and test set from it.
 
-Imported by both eval.py and infer_france.py.
+Imported by the checkpoint-driven entry points: scripts/vdict/build_vdicts.py
+(v-dict generation) and scripts/spatial/explain.py (spatial Shapley inference).
 """
 
 import copy
@@ -37,7 +38,7 @@ def build_model(checkpoint: dict, config: dict):
     data_name = cfg["data_name"]
 
     print(f"  Loading data to build architecture ({data_name})...", flush=True)
-    data_views = load_structure(input_dir, data_name, load_memory=cfg.get("load_memory", False))
+    data_views = load_structure(input_dir, data_name, load_memory=cfg.get("load_memory", False), views_used=cfg.get("experiment", {}).get("preprocess", {}).get("view_names", []))
     data_views.load_stats(input_dir, data_name)
     data_views.set_additional_info(**cfg["experiment"].get("preprocess", {}))
 
@@ -81,7 +82,7 @@ def load_test_data(checkpoint: dict, config: dict):
     if "train" in data_name:
         test_name = data_name.replace("train", "test")
         print(f"  Fixed split -> loading: {test_name}", flush=True)
-        data_te = load_structure(input_dir, test_name, load_memory=config.get("load_memory", False))
+        data_te = load_structure(input_dir, test_name, load_memory=config.get("load_memory", False), views_used=config.get("experiment", {}).get("preprocess", {}).get("view_names", []))
         data_te.load_stats(input_dir, data_name)
     else:
         indices_file = checkpoint.get("test_indices_file")
@@ -92,7 +93,7 @@ def load_test_data(checkpoint: dict, config: dict):
             )
         print(f"  K-fold -> indices from: {indices_file}", flush=True)
         test_indices = np.load(indices_file, allow_pickle=True)
-        data_te = load_structure(input_dir, data_name, load_memory=config.get("load_memory", False))
+        data_te = load_structure(input_dir, data_name, load_memory=config.get("load_memory", False), views_used=config.get("experiment", {}).get("preprocess", {}).get("view_names", []))
         data_te.load_stats(input_dir, data_name)
         data_te.set_val_mask(test_indices)
         data_te.set_data_mode(train=False)

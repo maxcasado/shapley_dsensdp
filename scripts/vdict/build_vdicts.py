@@ -1,20 +1,33 @@
 """
-eval.py
--------
-Load saved checkpoints and evaluate metrics on the associated test sets.
-Optionally computes Shapley values per view.
+scripts/vdict/build_vdicts.py  (ex-eval.py)
+-------------------------------------------
+SOURCE OF TRUTH generator. Loads saved checkpoints, evaluates metrics on the
+associated test sets, and (with --shapley) runs the 2^N-1 subset inferences to
+build the v-dict for each fold.
+
+With --shapley the v-dict is written in the prediction-storing v2 format
+(shap_analysis.shapley.run_subset_inference): the per-coalition softmax
+predictions are stored, so the characteristic function (f1_weighted, MCC,
+balanced accuracy, ...) becomes a post-processing flag downstream — no
+re-inference needed to change it.
+
+Canonical output layout (consumed by `scripts.attribution.build_all`):
+    results/com/vdict/v_dict_fold{0..4}.pkl        (--out_dir results/com/vdict)
+    results/com_geo/vdict/v_dict_fold{0..4}.pkl    (--out_dir results/com_geo/vdict --fixed_views geo)
 
 Usage:
     # Single fold
-    python eval.py -s config/dsensdp_ex.yaml -r 0 -f 0
-    python eval.py -s config/dsensdp_ex.yaml -r 0 -f 0 --shapley
+    python -m scripts.vdict.build_vdicts -s config/dsensdp_ex.yaml -r 0 -f 0 --shapley
 
-    # All folds — mean +- std reported
-    python eval.py -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4
-    python eval.py -s config/dsensdp_ex.yaml --fold_ids 0 1 2 3 4 --shapley
+    # All folds, v2 v-dicts to the canonical dir (regenerate the source of truth)
+    python -m scripts.vdict.build_vdicts -s config/com_average.yaml \\
+        --fold_ids 0 1 2 3 4 --shapley --out_dir results/com/vdict
+    python -m scripts.vdict.build_vdicts -s config/com_geo.yaml \\
+        --fold_ids 0 1 2 3 4 --shapley --fixed_views geo --out_dir results/com_geo/vdict
 """
 
 import argparse
+import pickle
 import sys
 import time
 import traceback
@@ -179,7 +192,7 @@ def _save_aggregated_csv(out_dir: Path, run_id: int,
 #  Per-fold computation
 # ==============================================================================
 
-def _run_fold(run_id: int, fold_id: int, args, config: dict) -> tuple:
+def _run_fold(run_id: int, fold_id: int, args, config: dict, out_dir: Path = None) -> tuple:
     """
     Run inference + optional Shapley for one fold.
 
@@ -238,17 +251,31 @@ def _run_fold(run_id: int, fold_id: int, args, config: dict) -> tuple:
     if args.shapley or args.interactions:
         view_names  = ckpt_config["experiment"]["preprocess"]["view_names"]
         metric_keys = list(metrics.keys())
-        log(f"  Computing Shapley over {len(view_names)} views: {view_names}")
+        fixed_views = args.fixed_views or []
+        log(f"  Computing Shapley over {len(view_names)} views: {view_names}"
+            + (f"  (fixed: {fixed_views})" if fixed_views else ""))
 
-        baseline = get_random_baseline_metrics(y_true, task_type)
-        v_dict   = run_subset_inference(
-            method, data_te, y_true, view_names, task_type, BS,
-            baseline, metrics, verbose=True,
-        )
+        v_dict_path = (out_dir / f"v_dict_fold{fold_id}.pkl") if out_dir is not None else None
+        if v_dict_path is not None and v_dict_path.exists():
+            log(f"  v_dict already exists -> loading from {v_dict_path}")
+            with open(v_dict_path, "rb") as f:
+                v_dict = pickle.load(f)
+        else:
+            baseline = get_random_baseline_metrics(y_true, task_type)
+            v_dict   = run_subset_inference(
+                method, data_te, y_true, view_names, task_type, BS,
+                baseline, metrics, verbose=True, fixed_views=fixed_views,
+                full_pred=outputs["prediction"],
+            )
+            if v_dict_path is not None:
+                v_dict_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(v_dict_path, "wb") as f:
+                    pickle.dump(v_dict, f)
+                log(f"  v_dict saved -> {v_dict_path}")
 
         # Shapley values
         if args.shapley:
-            sv_per_metric = compute_shapley_per_metric(v_dict, view_names, metric_keys)
+            sv_per_metric = compute_shapley_per_metric(v_dict, view_names, metric_keys, fixed_views=fixed_views)
             sep = "-" * 48
             for metric_name, sv in sv_per_metric.items():
                 log(f"\n  Shapley values [{metric_name}]:\n{sep}")
@@ -301,7 +328,7 @@ def run_inference(args):
 
     for fold_id in fold_ids:
         metrics_row, shapley_rows, interaction_rows = _run_fold(
-            run_id, fold_id, args, config
+            run_id, fold_id, args, config, out_dir=out_dir
         )
         if metrics_row is None:
             continue
@@ -430,6 +457,8 @@ def parse_args():
                    help="Compute per-view Shapley values.")
     p.add_argument("--interactions", action="store_true",
                    help="Compute Shapley Interaction Index (SII) per pair of views.")
+    p.add_argument("--fixed_views", nargs="+", default=None,
+                   help="Views always present in every coalition (not explained, phi=0).")
     p.add_argument("--save_predictions", default=None, metavar="PATH",
                    help="Path to save raw predictions (.npy).")
     args = p.parse_args()

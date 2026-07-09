@@ -18,35 +18,102 @@ import numpy as np
 from code.datasets.utils import create_dataloader
 from code.training.utils import output_name
 from utils.metrics import compute_metrics, get_random_baseline_metrics
+from .characteristic import char_value, baseline_metrics_all, DEFAULT_METRIC
+
+
+# ── v-dict access (format v1 / v2) ────────────────────────────────────────────
+#
+# v1 (legacy, on disk):  {frozenset(S) -> metrics_dict}
+# v2 (current):          {"format": "v2", "y_true": …, "task_type": …,
+#                         "coalitions": {frozenset(S) -> record}}
+#   record = {"pred": proba_NxC}                for a computed coalition
+#          | {"metrics": {...}}                 for the analytical baseline (∅ / fixed)
+#
+# All consumers below go through scalar_vdict(), so both formats work
+# transparently. Only v2 (predictions stored) supports swapping the
+# characteristic function as a post-processing flag; v1 stays pinned to the
+# metrics that were computed at inference time.
+
+def is_v2(v_dict: dict) -> bool:
+    """True if v_dict is the prediction-storing v2 format."""
+    return isinstance(v_dict, dict) and "coalitions" in v_dict
+
+
+def coalitions(v_dict: dict) -> dict:
+    """Return the {frozenset -> record} mapping regardless of format."""
+    return v_dict["coalitions"] if is_v2(v_dict) else v_dict
+
+
+def coalition_scalar(record, metric: str, y_true=None, task_type: str = "classification") -> float:
+    """
+    Collapse a single coalition record to the scalar v(S) under ``metric``.
+
+    v2 computed coalition -> evaluate the characteristic function on stored preds.
+    v2 baseline coalition -> read the stored analytical metric.
+    v1 record (plain metrics dict) -> read the stored scalar directly.
+    """
+    if isinstance(record, dict) and "pred" in record:
+        return char_value(y_true, record["pred"], metric, task_type)
+    # v2 baseline coalition, or v1 record (which IS the metrics dict).
+    metrics = record["metrics"] if isinstance(record, dict) and "metrics" in record else record
+    if metric not in metrics:
+        raise KeyError(
+            f"metric '{metric}' is not stored in this (legacy v1) v-dict "
+            f"(available: {sorted(metrics)}). Regenerate the v-dicts in v2 format "
+            f"(scripts.vdict.build_vdicts --shapley) to compute new characteristic "
+            f"functions like MCC/balanced_accuracy from stored predictions.")
+    return float(metrics[metric])
+
+
+def scalar_vdict(v_dict: dict, metric: str) -> dict:
+    """
+    Collapse a v-dict (v1 or v2) to {frozenset -> scalar v(S)} under ``metric``.
+
+    This is the single entry point every downstream computation uses, so the
+    characteristic function is chosen in exactly one place.
+    """
+    y_true    = v_dict.get("y_true") if is_v2(v_dict) else None
+    task_type = v_dict.get("task_type", "classification") if is_v2(v_dict) else "classification"
+    return {s: coalition_scalar(rec, metric, y_true, task_type)
+            for s, rec in coalitions(v_dict).items()}
 
 
 # ── Core formula ──────────────────────────────────────────────────────────────
 
-def shapley_values(view_names: list, v_dict: dict) -> dict:
+def shapley_values(view_names: list, v_dict: dict, fixed_views: list = None) -> dict:
     """
     Exact Shapley values via the cooperative game theory formula.
 
     Args:
-        view_names: Player names (sensor/modality names).
-        v_dict:     frozenset → scalar. Must contain frozenset() (empty coalition).
+        view_names:  Player names (sensor/modality names).
+        v_dict:      frozenset → scalar. Must contain frozenset() (empty coalition),
+                     or frozenset(fixed_views) when fixed_views is given.
+        fixed_views: Views always present in every coalition — not explained
+                     (phi=0), but implicitly included in every v_dict key looked up.
 
     Returns:
-        {view_name: shapley_value}
+        {view_name: shapley_value}. Fixed views get phi=0.
     """
-    n = len(view_names)
-    v_empty = v_dict.get(frozenset(), 0)
-    shapley = {}
+    fixed_views = fixed_views or []
+    free_views  = [v for v in view_names if v not in fixed_views]
+    fixed_set   = frozenset(fixed_views)
+    n_free      = len(free_views)
 
-    for view in view_names:
-        others = [v for v in view_names if v != view]
-        phi = v_empty / n
+    shapley = {}
+    for view in free_views:
+        others = [v for v in free_views if v != view]
+        phi = 0.0
         for size in range(len(others) + 1):
             for S_tuple in itertools.combinations(others, size):
-                S = frozenset(S_tuple)
-                s = len(S)
-                weight = math.factorial(s) * math.factorial(n - s - 1) / math.factorial(n)
+                S_free = frozenset(S_tuple)
+                S = S_free | fixed_set
+                s = len(S_free)
+                weight = math.factorial(s) * math.factorial(n_free - s - 1) / math.factorial(n_free)
                 phi += weight * (v_dict[S | {view}] - v_dict[S])
         shapley[view] = phi
+
+    for view in fixed_views:
+        shapley[view] = 0.0
 
     return shapley
 
@@ -63,9 +130,17 @@ def run_subset_inference(
     baseline_metrics: dict,
     full_metrics: dict,
     verbose: bool = False,
+    fixed_views: list = None,
+    full_pred: np.ndarray = None,
 ) -> dict:
     """
-    Run inference for all strict subsets (size 1 … N-1) and build the v_dict.
+    Run inference for all strict subsets (size 1 … N-1) and build the v2 v_dict.
+
+    The v2 format stores the raw per-coalition predictions (softmax probabilities),
+    NOT just a scalar metric. This is the key architectural point: with predictions
+    stored, the characteristic function (f1_weighted, MCC, balanced accuracy, …)
+    becomes a post-processing flag (see characteristic.py / scalar_vdict) instead of
+    requiring a fresh round of model inference.
 
     Args:
         method:           Trained model.
@@ -74,24 +149,43 @@ def run_subset_inference(
         view_names:       Full list of view/sensor names.
         task_type:        "classification" | "multilabel".
         batch_size:       Inference batch size.
-        baseline_metrics: Metrics for the empty coalition v(∅).
-        full_metrics:     Metrics for the full coalition v(N).
+        baseline_metrics: Analytical metrics for the empty coalition v(∅). Enriched
+                          with MCC / balanced_accuracy so v(∅) is metric-parametrizable.
+        full_metrics:     Metrics for the full coalition v(N); used only as a fallback
+                          if ``full_pred`` is not supplied.
         verbose:          Print progress for each subset.
+        fixed_views:      Views always present in every coalition (not explained, but
+                          kept in every forward pass). The fixed-only coalition is the
+                          baseline (no information added).
+        full_pred:        Softmax predictions of the full coalition v(N). Pass this so
+                          v(N) is metric-parametrizable like every other coalition.
 
     Returns:
-        v_dict: {frozenset → metrics_dict} for all coalitions including ∅ and N.
+        v_dict (v2): {"format": "v2", "y_true": …, "task_type": …,
+                      "coalitions": {frozenset(S) -> record}} with ∅ and N included.
     """
-    v_dict = {
-        frozenset():           baseline_metrics,
-        frozenset(view_names): full_metrics,
-    }
+    fixed_views = fixed_views or []
+    free_views  = [v for v in view_names if v not in fixed_views]
+    n_free      = len(free_views)
 
-    n_subsets = sum(math.comb(len(view_names), s) for s in range(1, len(view_names)))
+    # Analytical baseline (all metrics incl. MCC / balanced_accuracy) for v(∅).
+    baseline_all = {**baseline_metrics_all(y_true, task_type), **(baseline_metrics or {})}
+    baseline_rec = {"metrics": baseline_all}
+    full_rec = {"pred": np.asarray(full_pred)} if full_pred is not None else {"metrics": full_metrics}
+
+    coalition_records = {
+        frozenset():           baseline_rec,
+        frozenset(view_names): full_rec,
+    }
+    if fixed_views:
+        coalition_records[frozenset(fixed_views)] = baseline_rec
+
+    n_subsets = sum(math.comb(n_free, s) for s in range(1, n_free))
     done = 0
 
-    for size in range(1, len(view_names)):
-        for subset_tuple in itertools.combinations(view_names, size):
-            subset_list = list(subset_tuple)
+    for size in range(1, n_free):
+        for subset_tuple in itertools.combinations(free_views, size):
+            subset_list = list(subset_tuple) + fixed_views
             args_fwd = {
                 "inference_views": subset_list,
                 "missing_method":  method.missing_method,
@@ -103,15 +197,21 @@ def run_subset_inference(
                 perc_forward=1.0,
                 not_return_repre=True,
             )
-            sub_metrics = compute_metrics(y_true, out_sub["prediction"], task_type)
-            v_dict[frozenset(subset_list)] = sub_metrics
+            coalition_records[frozenset(subset_list)] = {"pred": np.asarray(out_sub["prediction"])}
             done += 1
 
             if verbose:
                 label = "+".join(subset_list)
-                print(f"  [{done}/{n_subsets}] {label} -> f1_macro={sub_metrics['f1_macro']:.4f}", flush=True)
+                f1w = char_value(y_true, out_sub["prediction"], "f1_weighted", task_type)
+                print(f"  [{done}/{n_subsets}] {label} -> f1_weighted={f1w:.4f}", flush=True)
 
-    return v_dict
+    return {
+        "format":     "v2",
+        "y_true":     np.asarray(y_true),
+        "task_type":  task_type,
+        "view_names": list(view_names),
+        "coalitions": coalition_records,
+    }
 
 
 # ── Aggregation ───────────────────────────────────────────────────────────────
@@ -120,6 +220,7 @@ def compute_shapley_per_metric(
     v_dict: dict,
     view_names: list,
     metric_keys: list,
+    fixed_views: list = None,
 ) -> dict:
     """
     Compute Shapley values for each metric from a pre-built v_dict.
@@ -128,14 +229,15 @@ def compute_shapley_per_metric(
         v_dict:      {frozenset → metrics_dict} (output of run_subset_inference).
         view_names:  Full list of view names.
         metric_keys: Metrics to compute Shapley values for.
+        fixed_views: Views always present in every coalition (phi=0 for these).
 
     Returns:
         {metric_name: {view_name: shapley_value}}
     """
     result = {}
     for metric_name in metric_keys:
-        v_scalar = {s: v_dict[s][metric_name] for s in v_dict}
-        result[metric_name] = shapley_values(view_names, v_scalar)
+        v_scalar = scalar_vdict(v_dict, metric_name)
+        result[metric_name] = shapley_values(view_names, v_scalar, fixed_views=fixed_views)
     return result
 
 
@@ -168,12 +270,13 @@ def compute_shapley_interactions_metrics(
     result = {}
 
     for metric_name in metric_keys:
+        v = scalar_vdict(v_dict, metric_name)
         sii = {}
         for i, vi in enumerate(view_names):
             for j, vj in enumerate(view_names):
                 if j <= i:
                     continue
-                others = [v for v in view_names if v not in (vi, vj)]
+                others = [v_ for v_ in view_names if v_ not in (vi, vj)]
                 phi_ij = 0.0
                 for size in range(len(others) + 1):
                     for S_tuple in itertools.combinations(others, size):
@@ -181,10 +284,10 @@ def compute_shapley_interactions_metrics(
                         s      = len(S)
                         weight = (math.factorial(s) * math.factorial(n - s - 2)
                                   / math.factorial(n - 1))
-                        delta  = (v_dict[S | {vi, vj}][metric_name]
-                                  - v_dict[S | {vi}][metric_name]
-                                  - v_dict[S | {vj}][metric_name]
-                                  + v_dict[S][metric_name])
+                        delta  = (v[S | {vi, vj}]
+                                  - v[S | {vi}]
+                                  - v[S | {vj}]
+                                  + v[S])
                         phi_ij += weight * delta
                 sii[(vi, vj)] = phi_ij
         result[metric_name] = sii
@@ -221,14 +324,14 @@ def compute_shapley_fold(
 
     columns = {}
 
-    # Raw subset metrics (stored for traceability)
-    for fs, metrics in v_dict.items():
-        if fs == frozenset():
-            continue
-        combi_str = "_".join(sorted(fs))
-        for k_m, v_m in metrics.items():
-            col = f"shapley_{combi_str}_{k_m}"
-            columns.setdefault(col, []).append(v_m)
+    # Raw subset metrics (stored for traceability) — recomputed per metric from v2.
+    for metric_name in metric_keys:
+        for fs, val in scalar_vdict(v_dict, metric_name).items():
+            if fs == frozenset():
+                continue
+            combi_str = "_".join(sorted(fs))
+            col = f"shapley_{combi_str}_{metric_name}"
+            columns.setdefault(col, []).append(val)
 
     # Shapley values per metric
     shapley_per_metric = compute_shapley_per_metric(v_dict, view_names, metric_keys)

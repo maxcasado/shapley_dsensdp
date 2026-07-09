@@ -41,7 +41,7 @@ def InputFusion_train(train_data: dict, val_data = None,
     if pre_trained_model is not None:
         full_model = pre_trained_model.get_student_model()
         if linear_probing:
-            for param in list(full_model.parameters())[:-1]: #except last layer
+            for param in list(full_model.parameters())[:-1]:
                 param.requires_grad = False
     else:    
         encoder_model = create_model(np.sum(feats_dims), emb_dim, **architecture["encoders"])
@@ -55,11 +55,11 @@ def InputFusion_train(train_data: dict, val_data = None,
     if "missing_as_aug" in training:
         model.set_missing_info(aug_status=training["missing_as_aug"], **training.get("missing_method", {}))
 
-    #DATA DEFITNION
+    #DATA DEFINITION
     train_dataloader, val_dataloader, monitor_name = build_dataloaders(train_data, val_data, batch_size=batch_size, parallel_processes=training.get("parallel_processes",2))
     extra_objects = prepare_callback(data_name, method_name, run_id, fold_id, folder_c, model.hparams_initial, monitor_name, **early_stop_args)
     
-    trainer = pl.Trainer(max_epochs=max_epochs, accelerator="gpu", devices = 1, callbacks=extra_objects["callbacks"]) #, profiler="simple")
+    trainer = pl.Trainer(max_epochs=max_epochs, accelerator="gpu", devices = 1, callbacks=extra_objects["callbacks"])
     trainer.fit(model, train_dataloader, val_dataloaders=val_dataloader)
 
     checkpoint = torch.load(trainer.checkpoint_callback.best_model_path)
@@ -94,6 +94,7 @@ def MultiFusion_train(train_data: dict, val_data = None,
     for view_n in train_data.used_view_names:
         actual_shape_v = get_shape_view(view_n, train_data, architecture=architecture)
         views_encoder[view_n] = create_model(actual_shape_v, emb_dim, **architecture["encoders"][view_n])
+
     #MODEL DEFINITION -- Fusion-Part
     args_model = {"loss_args": loss_args, **training.get("additional_args", {})}
     
@@ -103,7 +104,8 @@ def MultiFusion_train(train_data: dict, val_data = None,
         input_dim_task_mapp = fusion_module.get_info_dims()["joint_dim"]
 
         predictive_model = create_model(input_dim_task_mapp, n_labels, **architecture["predictive_model"], encoder=False) 
-        model = FeatureFusion(views_encoder, fusion_module, predictive_model,view_names=list(views_encoder.keys()), **args_model)
+        model = FeatureFusion(views_encoder, fusion_module, predictive_model,
+                              view_names=list(views_encoder.keys()), **args_model)
 
     else:
         method["agg_args"]["emb_dims"] = [n_labels for _ in range(len(views_encoder))]
@@ -119,26 +121,34 @@ def MultiFusion_train(train_data: dict, val_data = None,
                 pred_.load_state_dict(pred_base.state_dict())  
             prediction_models[view_n] = torch.nn.Sequential(views_encoder[view_n], pred_)
             prediction_models[view_n].get_output_size = pred_.get_output_size
-        model = DecisionFusion(view_encoders=prediction_models, fusion_module=fusion_module,view_names=list(views_encoder.keys()),**args_model)
+        model = DecisionFusion(view_encoders=prediction_models, fusion_module=fusion_module,
+                               view_names=list(views_encoder.keys()), **args_model)
+
     print("Initial parameters of model:", model.hparams_initial)
+
+    # Z-score normalization of logits before fusion (DSensDp eq. 3)
+    model.znorm_logits = method.get("znorm_logits", False)
+    if model.znorm_logits:
+        print("  znorm_logits: ENABLED (z-score normalization before fusion)", flush=True)
 
     if "missing_as_aug" in training:
         model.set_missing_info(aug_status=training["missing_as_aug"], **training.get("missing_method", {}))
                 
-    #DATA DEFINITION --
+    #DATA DEFINITION
     train_dataloader, val_dataloader, monitor_name = build_dataloaders(train_data, val_data, batch_size=batch_size, parallel_processes=training.get("parallel_processes",2))
     extra_objects = prepare_callback(data_name, method_name, run_id, fold_id, folder_c, model.hparams_initial, monitor_name, **early_stop_args)
     
-    trainer = pl.Trainer(max_epochs=max_epochs, accelerator="gpu", devices = 1, callbacks=extra_objects["callbacks"]) #, profiler="simple")
+    trainer = pl.Trainer(max_epochs=max_epochs, accelerator="gpu", devices = 1, callbacks=extra_objects["callbacks"])
     trainer.fit(model, train_dataloader, val_dataloaders=val_dataloader)
 
     checkpoint = torch.load(trainer.checkpoint_callback.best_model_path)
     model.load_state_dict(checkpoint['state_dict'])
     return model, trainer
 
+
 def build_model(train_data, training={}, method={}, architecture={}, **kwargs):
     import copy as _copy
-    training  = _copy.deepcopy(training)   # eviter de muter le config de l'appelant
+    training  = _copy.deepcopy(training)
     method    = _copy.deepcopy(method)
     loss_args = training["loss_args"]
     emb_dim   = training["emb_dim"]
@@ -181,6 +191,9 @@ def build_model(train_data, training={}, method={}, architecture={}, **kwargs):
             prediction_models[view_n].get_output_size = pred_.get_output_size
         model = DecisionFusion(view_encoders=prediction_models, fusion_module=fusion_module,
                                view_names=list(views_encoder.keys()), **args_model)
+
+    # Z-score normalization of logits before fusion (DSensDp eq. 3)
+    model.znorm_logits = method.get("znorm_logits", False)
 
     if "missing_as_aug" in training:
         model.set_missing_info(aug_status=training["missing_as_aug"],

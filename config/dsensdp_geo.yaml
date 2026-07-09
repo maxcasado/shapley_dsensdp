@@ -1,0 +1,120 @@
+output_dir_folder: ./res_out
+input_dir_folder: /home/casado/DsensDp/data/out/
+additional_method_name: -Plus_geo
+
+load_memory: True
+data_name: cropharvest_binary
+task_type: classification
+
+save_weights: True 
+save_test_set: True
+weights_dir: ./res_out/weights
+testset_dir: ./res_out/test_sets
+
+
+training:
+  max_epochs: 100 # was 2 changed to100 like in the paper
+  batch_size: 128 # was 256 changed to 128 like in the paper
+  emb_dim: 128
+  early_stop_args:
+    min_delta: 0.01
+    mode: min
+    patience: 5
+    verbose: True
+  parallel_processes: 1
+
+  missing_as_aug: True
+  missing_method:
+    random_perc: 0.0
+    name: ignore 
+
+  additional_args:
+    optimizer: adam 
+    lr: 0.001
+
+    weights_loss_variations:
+      main: 1
+      full : 1
+      individual_sd: 1
+      individual: 1
+
+      cross_temp: 0.5
+
+experiment: 
+  runs_seed: [10] #repetitions
+  kfolds: 10
+  preprocess: 
+    fillnan: False
+    flatten: False
+    form: zscore  
+    view_names: ["S2_S2VI","S1" ,"weather","DEM","geo"]
+
+# args_forward: #only for testing
+#   list_testing_views: [
+#     [ ["S2_S2VI"], [1.00] ] , #single-view prediction
+#     [ ["S1"], [1.00] ] , #single-view prediction
+#     [ ["weather"], [1.00] ] , #single-view prediction
+#     [ ["DEM"], [1.00] ] , #single-view prediction
+#     [ ["S2_S2VI", "weather", "DEM"], [1.0] ], #multi-view prediction
+#     [ ["S2_S2VI", "S1", "DEM"], [1.0] ], #multi-view prediction
+#     [ ["S2_S2VI", "S1", "weather"], [1.0] ], #multi-view prediction
+#     [ ["S1", "weather", "DEM"], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 , 0.9, 1.00] ], #only missing S2 in different rates
+#   ]
+#   batch_size: 64
+
+
+architecture:
+  encoders:
+    S1:
+      model_type: tempcnn
+      dropout: 0.2
+      kernel_size: 5 #default value: 5
+      layer_size: 128 #default value: 128
+      n_layers: 2 #default value: 3
+      seq_len: 12
+      use_norm: False
+    S2_S2VI:
+      model_type: tempcnn
+      dropout: 0.2
+      kernel_size: 5 #default value: 5
+      layer_size: 128 #default value: 128
+      n_layers: 2 #default value: 3
+      seq_len: 12
+      use_norm: False
+    weather: 
+      model_type: tempcnn
+      dropout: 0.2
+      kernel_size: 5 #default value: 5
+      layer_size: 128 #default value: 128
+      n_layers: 2 #default value: 3
+      seq_len: 12
+      use_norm: False
+    DEM: 
+      model_type: mlp
+      n_layers: 1
+      layer_size: 128
+      dropout: 0.2
+      batchnorm: False
+      use_norm: False
+    geo:
+      model_type: mlp
+      n_layers: 1
+      layer_size: 128
+      dropout: 0.2
+      batchnorm: False
+      use_norm: False
+
+
+  predictive_model:
+    n_layers: 1
+    layer_size: 128
+    dropout: 0.2
+    batchnorm: True
+
+    use_norm_last: True
+
+
+method: 
+  feature: False
+  agg_args:
+    mode: avg #param: avg, uncweight

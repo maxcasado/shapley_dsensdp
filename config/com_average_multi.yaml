@@ -1,15 +1,16 @@
-output_dir_folder: ./res_out
+output_dir_folder: ./res_out_multi_geoless
 input_dir_folder: /home/casado/DsensDp/data/out/
-additional_method_name: FCoM-avg
+additional_method_name: FCoM-avg-multi
 
 load_memory: True
-data_name: cropharvest_binary
+data_name: cropharvest_multi
 task_type: classification
 
 save_weights: True 
 save_test_set: True
-weights_dir: ./res_out/weights
-testset_dir: ./res_out/test_sets
+weights_dir: ./res_out_multi/weights
+testset_dir: ./res_out_multi/test_sets
+
 
 training:
   #max_epochs: 2  # valeur de test originale
@@ -40,18 +41,18 @@ experiment:
     view_names: ["S2_S2VI","S1","weather","DEM"]
 
 # args_forward: (à utiliser séparément avec evaluate_rob_pred.py)
-args_forward:
-  list_testing_views: [
-    [ ["S2_S2VI", "S1", "weather"], [1.00] ],
-    [ ["S2_S2VI", "S1", "DEM"],     [1.00] ],
-    [ ["S2_S2VI", "weather", "DEM"],[1.00] ],
-    [ ["S1", "weather", "DEM"],     [1.00] ],
-    [ ["S2_S2VI"], [1.00] ],
-    [ ["S1"],      [1.00] ],
-    [ ["weather"], [1.00] ],
-    [ ["DEM"],     [1.00] ],
-  ]
-  batch_size: 64
+# args_forward:
+#   list_testing_views: [
+#     [ ["S2_S2VI", "S1", "weather"], [1.00] ],
+#     [ ["S2_S2VI", "S1", "DEM"],     [1.00] ],
+#     [ ["S2_S2VI", "weather", "DEM"],[1.00] ],
+#     [ ["S1", "weather", "DEM"],     [1.00] ],
+#     [ ["S2_S2VI"], [1.00] ],
+#     [ ["S1"],      [1.00] ],
+#     [ ["weather"], [1.00] ],
+#     [ ["DEM"],     [1.00] ],
+#   ]
+#   batch_size: 64
 
 architecture:
   encoders:

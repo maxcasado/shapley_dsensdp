@@ -1,6 +1,6 @@
 output_dir_folder: ./res_out
 input_dir_folder: /home/casado/DsensDp/data/out/
-additional_method_name: FCoM-avg
+additional_method_name: FCoM-avg-geo
 
 load_memory: True
 data_name: cropharvest_binary
@@ -37,21 +37,19 @@ experiment:
     fillnan: False
     flatten: False
     form: zscore
-    view_names: ["S2_S2VI","S1","weather","DEM"]
+    view_names: ["S2_S2VI","S1","weather","DEM", "geo"]
 
 # args_forward: (à utiliser séparément avec evaluate_rob_pred.py)
-args_forward:
-  list_testing_views: [
-    [ ["S2_S2VI", "S1", "weather"], [1.00] ],
-    [ ["S2_S2VI", "S1", "DEM"],     [1.00] ],
-    [ ["S2_S2VI", "weather", "DEM"],[1.00] ],
-    [ ["S1", "weather", "DEM"],     [1.00] ],
-    [ ["S2_S2VI"], [1.00] ],
-    [ ["S1"],      [1.00] ],
-    [ ["weather"], [1.00] ],
-    [ ["DEM"],     [1.00] ],
-  ]
-  batch_size: 64
+# args_forward:
+#   list_testing_views: [
+#     [ ["S2_S2VI"], [1.00] ],
+#     [ ["S1"], [1.00] ],
+#     [ ["S2_S2VI", "S1"], [1.00] ],
+#     [ ["weather", "DEM"], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.00] ],
+#     [ ["S1","weather", "DEM"], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.00] ],
+#     [ ["S2_S2VI","weather", "DEM"], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.00] ],
+#   ]
+#   batch_size: 64
 
 architecture:
   encoders:
@@ -86,6 +84,13 @@ architecture:
       dropout: 0.2
       batchnorm: False
       use_norm: True
+    geo:
+      model_type: mlp
+      n_layers: 1
+      layer_size: 128
+      dropout: 0.2
+      batchnorm: False
+      use_norm: False
   predictive_model:
     n_layers: 1
     layer_size: 128

@@ -13,14 +13,14 @@ def prepare_callback(data_name, method_name, run_id, fold_id, folder_c, tags_ml,
         v.unlink()
     early_stop_callback = EarlyStopping(monitor=monitor_name, **early_stop_args)
     checkpoint_callback = ModelCheckpoint(monitor=monitor_name, mode=early_stop_args["mode"], every_n_epochs=1, save_top_k=1,
-        dirpath=f'{save_dir_chkpt}/{exp_folder_name}/', filename=f'r={run_id:02d}_{fold_id:02d}-'+'{epoch}-{step}-{val_objective:.2f}')
+        dirpath=f'{save_dir_chkpt}/{exp_folder_name}/', filename=f'r={run_id:02d}_{fold_id:02d}-'+'{epoch}-{step}-{val_loss_full:.2f}')
     tags_ml = dict(tags_ml,**{"data_name":data_name,"method_name":method_name})
     return {"callbacks": [early_stop_callback,checkpoint_callback] }
 
 def build_dataloaders(train_data, val_data=None, batch_size=32, parallel_processes=2):
     if type(val_data) != type(None):
         val_dataloader = create_dataloader(val_data, batch_size=batch_size, train=False, parallel_processes=parallel_processes)
-        monitor_name = "val_objective"
+        monitor_name = "val_loss_full"
     else:
         val_dataloader = None
         monitor_name = "train_objective"
